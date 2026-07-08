@@ -82,6 +82,35 @@ const parseJSON = (txt) => {
   try{return JSON.parse(fixed);}catch(e){throw new Error("JSON parse failed: "+e.message+" | raw: "+s.slice(0,120));}
 };
 
+// Full articles: metadata as JSON + article body as plain text (avoids JSON-breaking quotes/newlines)
+const parseArticleResponse = (txt) => {
+  const raw = (txt || "").trim();
+  const metaMatch = raw.match(/<<<META>>>\s*([\s\S]*?)\s*<<<ARTICLE>>>/i);
+  const articleMatch = raw.match(/<<<ARTICLE>>>\s*([\s\S]*?)(?:\s*<<<END>>>|$)/i);
+  if (metaMatch) {
+    const meta = parseJSON(metaMatch[1].trim());
+    const article = (articleMatch ? articleMatch[1] : "").trim();
+    if (!article) throw new Error("המאמר חזר ריק — נסה שוב");
+    return {
+      title: meta.title || "",
+      metaTitle: meta.metaTitle || meta.title || "",
+      metaDescription: meta.metaDescription || "",
+      slug: meta.slug || "",
+      readTime: meta.readTime || "",
+      keywords: meta.keywords || [],
+      lsiKeywords: meta.lsiKeywords || [],
+      outline: meta.outline || [],
+      article,
+      altTexts: meta.altTexts || [],
+      internalLinkSuggestions: meta.internalLinkSuggestions || [],
+      seoScore: meta.seoScore || 80,
+      seoTips: meta.seoTips || [],
+    };
+  }
+  // Fallback: old single-JSON format
+  return parseJSON(raw);
+};
+
 const notesBlock=(notes)=>notes?.trim()?"\nClient feedback / corrections (MUST follow):\n"+notes.trim()+"\n":"";
 
 // ── DATA LAYER ────────────────────────────────────────────────────────────────
@@ -919,15 +948,20 @@ function ContentWriter({clientId,articleId,onBack}){
         "Write a full Hebrew SEO blog article.\n"+
         "Client: "+(form.clientName||"?")+" | Domain: "+(form.domain||"?")+" | Industry: "+(form.industry||"?")+" | Location: "+(client?.location||"")+"\n"+
         "Topic: "+form.topic+"\nKeywords: "+form.keywords+"\n"+
-        (brief?"Preferred title: "+brief.briefTitle+"\nAngle: "+brief.angle+"\n":"")+
+        (brief?"Preferred title: "+brief.briefTitle+"\nAngle: "+brief.angle+"\nOutline: "+(brief.outline||[]).join(" | ")+"\n":"")+
         "Type: "+tL+" | Tone: "+nL+" | Length: ~"+form.wordCount+" words\n"+
         ((client?.focusedKeywords||[]).length>0?"\nFocused keywords to prioritize: "+(client.focusedKeywords).join(", ")+"\n":"")+
         notesBlock(articleInstructions.trim()||article?.notes||"")+
         "\nCurrent year is 2026. Use 2026 in titles and content unless explicitly told otherwise.\n"+
-        "\nReturn ONLY valid JSON:\n"+
-        '{"title":"","metaTitle":"","metaDescription":"","slug":"","readTime":"","keywords":[],"lsiKeywords":[],"outline":[{"heading":"","subheadings":[]}],"article":"","altTexts":[],"internalLinkSuggestions":[],"seoScore":85,"seoTips":[]}';
-      const txt=await callClaude(prompt,4000);
-      setResult(parseJSON(txt));setTab("article");
+        "\nOUTPUT FORMAT — follow EXACTLY (do not wrap in markdown):\n"+
+        "<<<META>>>\n"+
+        '{"title":"...","metaTitle":"...","metaDescription":"...","slug":"english-kebab-case","readTime":"X דקות","keywords":["k1","k2"],"lsiKeywords":["l1","l2"],"outline":[{"heading":"...","subheadings":["..."]}],"altTexts":["..."],"internalLinkSuggestions":["..."],"seoScore":85,"seoTips":["..."]}\n'+
+        "<<<ARTICLE>>>\n"+
+        "Full article body in Hebrew markdown (## H2, ### H3, paragraphs). Plain text — NOT inside JSON.\n"+
+        "<<<END>>>\n"+
+        "META JSON must be short and valid. NEVER put the article body inside the META JSON. NEVER use double-quote inside META string values.";
+      const txt=await callClaude(prompt,8000);
+      setResult(parseArticleResponse(txt));setTab("article");
       if(schedDate&&articleId&&clientId){
         DB.updateArticle(clientId,articleId,{scheduledDate:schedDate,status:"scheduled"});
       }

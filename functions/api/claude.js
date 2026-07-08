@@ -14,6 +14,13 @@ export async function onRequestPost({ request, env }) {
   const { prompt, maxTokens } = body;
   if (!prompt) return json({ error: "prompt is required" }, 400);
 
+  // Article generation uses <<<META>>>/<<<ARTICLE>>> markers — allow that format.
+  // Briefs/scans still expect pure JSON.
+  const wantsMarkers = /<<<META>>>|<<<ARTICLE>>>/i.test(prompt || "");
+  const system = wantsMarkers
+    ? "Follow the user's output format exactly. For META: output ONLY valid compact JSON between the markers. For ARTICLE: plain Hebrew markdown text, not JSON. Never wrap the whole response in markdown code fences."
+    : "You are a JSON API. ONLY output raw valid JSON. No markdown, no backticks, no explanations. NEVER use double-quote characters inside JSON string values — use single quotes or rephrase.";
+
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -23,9 +30,8 @@ export async function onRequestPost({ request, env }) {
     },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
-      max_tokens: maxTokens || 2000,
-      system:
-        "You are a JSON API. ONLY output raw valid JSON. No markdown, no backticks, no explanations. NEVER use double-quote characters inside JSON string values — use single quotes or rephrase.",
+      max_tokens: Math.min(Math.max(maxTokens || 2000, 256), 16000),
+      system,
       messages: [{ role: "user", content: prompt }],
     }),
   });
