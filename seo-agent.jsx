@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { supabase } from "./src/supabaseClient.js";
 
 const ACCENT = "#0a0f1e";
 const BLUE   = "#2563eb";
@@ -22,25 +23,23 @@ const STATUS_LABEL = { suggested:"מוצע", briefed:"תקציר אושר", sche
 const STATUS_COLOR = { suggested:BLUE, briefed:AMBER, scheduled:PURPLE, published:GREEN };
 
 const callClaude = async (msg, maxTokens = 2000) => {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch("/api/claude", {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": import.meta.env.VITE_ANTHROPIC_API_KEY || "",
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: maxTokens,
-      system: "You are a JSON API. ONLY output raw valid JSON. No markdown, no backticks, no explanations. NEVER use double-quote characters inside JSON string values — use single quotes or rephrase.",
-      messages: [{ role: "user", content: msg }],
-    }),
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: msg, maxTokens }),
   });
-  if (!res.ok) throw new Error("API " + res.status + ": " + (await res.text()).slice(0, 200));
   const d = await res.json();
-  if (d.error) throw new Error(d.error.message);
-  return d.content?.map(i => i.text || "").join("") || "";
+  if (!res.ok) throw new Error("API " + res.status + ": " + (d.error || "unknown error"));
+  return d.text || "";
+};
+
+const pushToWorker = async (client, content) => {
+  const res = await fetch(client.workerUrl.replace(/\/$/,"") + "/seo-api/articles", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + client.token },
+    body: JSON.stringify(content),
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
 };
 
 const parseJSON = (txt) => {
@@ -69,9 +68,29 @@ const parseJSON = (txt) => {
 };
 
 // ── DATA LAYER ────────────────────────────────────────────────────────────────
+// localStorage stays the synchronous source of truth for rendering; every write
+// is also mirrored to Supabase (debounced) so data survives cache clears and is
+// available from other devices. On boot, DB.hydrate() pulls Supabase → local.
+let syncTimer = null;
+function syncToSupabase(list) {
+  if (!supabase) return;
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(async () => {
+    if (!list.length) return;
+    const rows = list.map(c => ({ id: c.id, data: c, updated_at: new Date().toISOString() }));
+    await supabase.from("seo_clients").upsert(rows);
+  }, 600);
+}
+
 const DB = {
   get()   { try{return JSON.parse(localStorage.getItem("seo_v2")||"[]");}catch{return[];} },
-  save(l) { localStorage.setItem("seo_v2", JSON.stringify(l)); },
+  save(l) { localStorage.setItem("seo_v2", JSON.stringify(l)); syncToSupabase(l); },
+  async hydrate() {
+    if (!supabase) return;
+    const { data, error } = await supabase.from("seo_clients").select("data");
+    if (error || !data || data.length === 0) return;
+    localStorage.setItem("seo_v2", JSON.stringify(data.map(r => r.data)));
+  },
   upsert(data) {
     const list = this.get();
     const idx  = list.findIndex(c => c.domain === data.domain);
@@ -311,22 +330,25 @@ function SiteScanner({onClientSaved}){
 }
 
 // ── CLIENT MANAGER ────────────────────────────────────────────────────────────
-function ClientManager({onWriteArticle}){
+function ClientManager({onWriteArticle,initialOpenId}){
   const [clients,setClients]=useState(DB.get());
-  const [openId,setOpenId]=useState(null);
+  const [openId,setOpenId]=useState(initialOpenId||null);
   const [cardTab,setCardTab]=useState("articles");
   const [customDir,setCustomDir]=useState("");
   const [addingCustom,setAddingCustom]=useState(false);
   const [genBriefId,setGenBriefId]=useState(null);
-  const [focusedKeywords,setFocusedKeywords]=useState([]);
+  const initialClient=initialOpenId?DB.getById(initialOpenId):null;
+  const [focusedKeywords,setFocusedKeywords]=useState(initialClient?.focusedKeywords||[]);
   const [fixModal,setFixModal]=useState(null);
+  const [versionsModal,setVersionsModal]=useState(null);
+  const [reverting,setReverting]=useState(false);
   const refresh=()=>setClients(DB.get());
 
   const client=openId?DB.getById(openId):null;
 
   // update Worker settings
-  const [workerUrl,setWorkerUrl]=useState("");
-  const [token,setToken]=useState("");
+  const [workerUrl,setWorkerUrl]=useState(initialClient?.workerUrl||"");
+  const [token,setToken]=useState(initialClient?.token||"");
 
   const openCard=(id)=>{
     const c=DB.getById(id);
@@ -384,6 +406,26 @@ function ClientManager({onWriteArticle}){
     DB.update(openId,{audit:newAudit});
     setFixModal(null);
     refresh();
+  };
+
+  const revertVersion=async(article,version)=>{
+    const c=DB.getById(openId);
+    if(!c?.workerUrl){alert("הגדר Worker URL בהגדרות הלקוח");return;}
+    setReverting(true);
+    try{
+      const now=new Date().toISOString();
+      await pushToWorker(c,{title:version.title,metaTitle:version.metaTitle,metaDescription:version.metaDescription,content:version.content,keywords:version.keywords,slug:version.slug,publishedAt:now});
+      const remaining=(article.versions||[]).filter(v=>v.version!==version.version);
+      const archived={...article.publishedContent,publishedAt:article.publishedAt,version:(article.versions?.length||0)+1};
+      DB.updateArticle(openId,article.id,{
+        publishedAt:now, slug:version.slug,
+        publishedContent:{title:version.title,metaTitle:version.metaTitle,metaDescription:version.metaDescription,content:version.content,keywords:version.keywords,slug:version.slug},
+        versions:[...remaining,archived],
+      });
+      setVersionsModal(null);
+      refresh();
+    }catch(e){alert("שגיאה בשחזור: "+e.message);}
+    setReverting(false);
   };
 
   const addCustomArticle=async()=>{
@@ -528,13 +570,26 @@ function ClientManager({onWriteArticle}){
                       </div>
                     </div>
                     <div style={{display:"flex",gap:8,flexShrink:0,alignItems:"center",flexWrap:"wrap"}}>
-                      {a.status!=="published"&&(
+                      {a.status!=="published"?(
                         <>
                           <input type="date" value={a.scheduledDate||""} onChange={e=>scheduleArticle(a.id,e.target.value)}
                             style={{padding:"5px 9px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:12,color:ACCENT,outline:"none",direction:"ltr"}}/>
                           <button onClick={()=>onWriteArticle(client.id,a.id)}
                             style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
                             ✦ כתוב
+                          </button>
+                        </>
+                      ):(
+                        <>
+                          {(a.versions||[]).length>0&&(
+                            <button onClick={()=>setVersionsModal({article:a})}
+                              style={{background:"#f1f5f9",color:"#64748b",border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
+                              🕐 היסטוריה ({a.versions.length})
+                            </button>
+                          )}
+                          <button onClick={()=>onWriteArticle(client.id,a.id)}
+                            style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
+                            ✏ עדכן מאמר
                           </button>
                         </>
                       )}
@@ -710,6 +765,37 @@ function ClientManager({onWriteArticle}){
         </div>
       </div>
     )}
+
+    {/* ── VERSIONS MODAL ── */}
+    {versionsModal&&(
+      <div style={{position:"fixed",inset:0,background:"#0f172a90",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+        <div style={{background:"#fff",borderRadius:16,padding:"26px 28px",maxWidth:600,width:"100%",maxHeight:"80vh",overflowY:"auto",direction:"rtl",fontFamily:"Heebo,sans-serif"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+            <div style={{fontSize:16,fontWeight:800,color:ACCENT}}>🕐 היסטוריית גרסאות</div>
+            <button onClick={()=>setVersionsModal(null)} style={{background:"#f1f5f9",border:"none",borderRadius:7,padding:"6px 12px",fontSize:12,fontWeight:700,cursor:"pointer",color:"#64748b"}}>✕ סגור</button>
+          </div>
+          <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:9,padding:"10px 14px",marginBottom:14,fontSize:12,color:"#166534"}}>
+            גרסה נוכחית: {versionsModal.article.publishedContent?.title||versionsModal.article.title} · פורסם {formatDate(versionsModal.article.publishedAt)}
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {[...(versionsModal.article.versions||[])].sort((a,b)=>b.version-a.version).map(v=>(
+              <div key={v.version} style={{border:"1px solid #e2e8f0",borderRadius:10,padding:"12px 16px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+                  <div>
+                    <div style={{fontSize:13,fontWeight:700,color:ACCENT}}>{v.title}</div>
+                    <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>פורסם {formatDate(v.publishedAt)}</div>
+                  </div>
+                  <button onClick={()=>revertVersion(versionsModal.article,v)} disabled={reverting}
+                    style={{background:reverting?"#94a3b8":AMBER,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:reverting?"not-allowed":"pointer",flexShrink:0}}>
+                    ↩ שחזר גרסה זו
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    )}
     </div>
   );
 }
@@ -789,15 +875,17 @@ function ContentWriter({clientId,articleId,onBack}){
     if(!client?.workerUrl){setError("הגדר Worker URL בהגדרות הלקוח");return;}
     setPublishing(true);setError(null);
     try{
-      const res=await fetch(client.workerUrl.replace(/\/$/,"")+"/seo-api/articles",{
-        method:"POST",
-        headers:{"Content-Type":"application/json","Authorization":"Bearer "+client.token},
-        body:JSON.stringify({slug:result.slug,title:result.title,metaTitle:result.metaTitle,metaDescription:result.metaDescription,content:result.article,keywords:result.keywords,publishedAt:new Date().toISOString()}),
-      });
-      if(!res.ok)throw new Error("HTTP "+res.status);
       const now=new Date().toISOString();
+      const content={title:result.title,metaTitle:result.metaTitle,metaDescription:result.metaDescription,content:result.article,keywords:result.keywords,slug:result.slug};
+      await pushToWorker(client,{...content,publishedAt:now});
       setPublished(true);
-      if(articleId&&clientId){DB.updateArticle(clientId,articleId,{status:"published",publishedAt:now,slug:result.slug});}
+      if(articleId&&clientId){
+        const prevVersions=article?.versions||[];
+        const nextVersions=article?.publishedContent
+          ? [...prevVersions,{...article.publishedContent,publishedAt:article.publishedAt,version:prevVersions.length+1}]
+          : prevVersions;
+        DB.updateArticle(clientId,articleId,{status:"published",publishedAt:now,slug:result.slug,publishedContent:content,versions:nextVersions});
+      }
     }catch(e){setError("שגיאת פרסום: "+e.message);}
     setPublishing(false);
   };
@@ -1046,11 +1134,25 @@ export default function SEOAgent(){
   const [page,setPage]=useState("scan");
   const [writeProps,setWriteProps]=useState(null);
   const [openClientId,setOpenClientId]=useState(null);
+  const [ready,setReady]=useState(!supabase); // no Supabase configured → skip hydration wait
+
+  useEffect(()=>{
+    if(!supabase)return;
+    DB.hydrate().finally(()=>setReady(true));
+  },[]);
 
   const goWrite=(clientId,articleId)=>{setWriteProps({clientId,articleId});setPage("write");};
   const goClients=(clientId)=>{setOpenClientId(clientId);setPage("clients");};
 
   const totalScheduled=DB.get().reduce((s,c)=>s+(c.articles||[]).filter(a=>a.status==="scheduled").length,0);
+
+  if(!ready){
+    return(
+      <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#f1f5f9"}}>
+        <Spin size={32}/>
+      </div>
+    );
+  }
 
   return(
     <>
