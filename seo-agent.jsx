@@ -64,8 +64,25 @@ const parseJSON = (txt) => {
     if(inStr&&c==='\t'){out+='\\t';i++;continue;}
     out+=c;i++;
   }
-  try{return JSON.parse(out);}catch(e){throw new Error("JSON parse failed: "+e.message+" | raw: "+s.slice(0,120));}
+  try{return JSON.parse(out);}catch{}
+  // Last resort: close truncated strings/brackets (response hit max_tokens)
+  let fixed=out, inStr2=false, esc2=false, braces=0, brackets=0;
+  for(let i=0;i<fixed.length;i++){
+    const c=fixed[i];
+    if(esc2){esc2=false;continue;}
+    if(c==="\\"&&inStr2){esc2=true;continue;}
+    if(c==='"'){inStr2=!inStr2;continue;}
+    if(inStr2)continue;
+    if(c==="{")braces++; if(c==="}")braces--;
+    if(c==="[")brackets++; if(c==="]")brackets--;
+  }
+  if(inStr2)fixed+='"';
+  while(brackets>0){fixed+="]";brackets--;}
+  while(braces>0){fixed+="}";braces--;}
+  try{return JSON.parse(fixed);}catch(e){throw new Error("JSON parse failed: "+e.message+" | raw: "+s.slice(0,120));}
 };
+
+const notesBlock=(notes)=>notes?.trim()?"\nClient feedback / corrections (MUST follow):\n"+notes.trim()+"\n":"";
 
 // ── DATA LAYER ────────────────────────────────────────────────────────────────
 // localStorage stays the synchronous source of truth for rendering; every write
@@ -281,7 +298,7 @@ function SiteScanner({onClientSaved}){
       const articles=(suggested.suggestions||[]).map(s=>({
         id:uid(), title:s.title, keywords:s.keywords, type:s.type||"informational",
         reason:s.reason, priority:s.priority, status:"suggested", source:"suggested",
-        brief:null, scheduledDate:null, publishedAt:null, slug:"",
+        brief:null, notes:"", scheduledDate:null, publishedAt:null, slug:"",
       }));
 
       const client=DB.upsert({
@@ -438,14 +455,14 @@ function ClientManager({onWriteArticle,initialOpenId}){
         "Custom direction: "+customDir+"\n"+
         "Industry: "+c.industry+"\nLocation: "+(c.location||"ישראל")+"\nBusiness: "+c.name+"\nKeywords: "+(c.mainKeywords||[]).join(", ")+"\n"+
         ((c.focusedKeywords||[]).length>0?"Focused keywords to integrate: "+c.focusedKeywords.join(", ")+"\n":"")+"\n"+
-        'Return ONLY valid JSON: {"title":"...","keywords":"...","type":"informational","brief":{"briefTitle":"...","angle":"...","outline":["...","...","...","...","..."],"primaryKeyword":"...","whyThisArticle":"..."}}\n'+
-        "All values in Hebrew. NEVER use double-quote inside string values.";
-      const txt=await callClaude(prompt,600);
+        'Return ONLY valid JSON: {"title":"...","keywords":"...","type":"informational","brief":{"briefTitle":"...","angle":"...","outline":["...","...","..."],"primaryKeyword":"...","whyThisArticle":"..."}}\n'+
+        "Keep outline to 3 short items. All values in Hebrew. NEVER use double-quote inside string values.";
+      const txt=await callClaude(prompt,1500);
       const data=parseJSON(txt);
       const article={
         id:uid(), title:data.title||customDir, keywords:data.keywords||"",
         type:data.type||"informational", reason:"מאמר מותאם אישית", priority:"high",
-        status:"briefed", source:"custom", brief:data.brief||null,
+        status:"briefed", source:"custom", brief:data.brief||null, notes:"",
         scheduledDate:null, publishedAt:null, slug:"",
       };
       DB.addArticle(openId,article);
@@ -458,6 +475,33 @@ function ClientManager({onWriteArticle,initialOpenId}){
   const scheduleArticle=(articleId,date)=>{
     DB.updateArticle(openId,articleId,{scheduledDate:date,status:date?"scheduled":"briefed"});
     refresh();
+  };
+
+  const saveArticleNotes=(articleId,notes)=>{
+    DB.updateArticle(openId,articleId,{notes});
+    refresh();
+  };
+
+  const regenerateBriefFromNotes=async(article)=>{
+    if(!openId||!article)return;
+    setGenBriefId(article.id);
+    try{
+      const c=DB.getById(openId);
+      const prompt=
+        "Create a Hebrew SEO article brief.\n\n"+
+        "Topic: "+article.title+"\nKeywords: "+(article.keywords||"")+
+        "\nIndustry: "+(c.industry||"")+"\nLocation: "+(c.location||"")+
+        "\nArticle type: "+(article.type||"informational")+
+        notesBlock(article.notes)+
+        ((c.focusedKeywords||[]).length>0?"\nFocused keywords: "+c.focusedKeywords.join(", ")+"\n":"")+
+        "\nReturn ONLY valid JSON: {\"briefTitle\":\"...\",\"angle\":\"...\",\"outline\":[\"...\",\"...\",\"...\"],\"primaryKeyword\":\"...\",\"whyThisArticle\":\"...\"}\n"+
+        "Keep outline to 3 short items. All values in Hebrew. NEVER use double-quote inside string values.";
+      const txt=await callClaude(prompt,1500);
+      const b=parseJSON(txt);
+      DB.updateArticle(openId,article.id,{brief:b,status:"briefed"});
+      refresh();
+    }catch(e){alert("שגיאה: "+e.message);}
+    setGenBriefId(null);
   };
 
   const formatDate=(d)=>{
@@ -595,10 +639,27 @@ function ClientManager({onWriteArticle,initialOpenId}){
                       )}
                     </div>
                   </div>
+                  {a.reason&&!a.brief&&(
+                    <div style={{marginTop:8,fontSize:12,color:"#64748b",lineHeight:1.6,fontFamily:"Heebo,sans-serif"}}>{a.reason}</div>
+                  )}
                   {a.brief&&(
                     <div style={{marginTop:10,background:"#f8fafc",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#64748b",fontFamily:"Heebo,sans-serif"}}>
-                      <div style={{fontWeight:700,color:ACCENT,marginBottom:4}}>{a.brief.angle}</div>
+                      <div style={{fontWeight:700,color:ACCENT,marginBottom:4}}>{a.brief.angle||a.brief.briefTitle}</div>
                       {(a.brief.outline||[]).map((p,i)=><div key={i}>• {p}</div>)}
+                    </div>
+                  )}
+                  {a.status!=="published"&&(
+                    <div style={{marginTop:10}}>
+                      <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",letterSpacing:1,marginBottom:5,textTransform:"uppercase"}}>הערות / תיקונים</div>
+                      <textarea value={a.notes||""} onChange={e=>saveArticleNotes(a.id,e.target.value)}
+                        placeholder="לדוגמה: שנה 2025 ל-2026, הדגש דגם 1000, אל תזכיר מתחרים..."
+                        rows={2} style={{width:"100%",padding:"8px 11px",border:"1.5px solid #e2e8f0",borderRadius:8,fontSize:12,fontFamily:"Heebo,sans-serif",resize:"vertical",outline:"none",boxSizing:"border-box",direction:"rtl",background:a.notes?"#fffbeb":"#fff"}}/>
+                      {a.notes?.trim()&&(
+                        <button onClick={()=>regenerateBriefFromNotes(a)} disabled={genBriefId===a.id}
+                          style={{marginTop:6,background:genBriefId===a.id?"#94a3b8":AMBER,color:"#fff",border:"none",borderRadius:7,padding:"6px 12px",fontSize:11,fontWeight:700,cursor:genBriefId===a.id?"not-allowed":"pointer",fontFamily:"Heebo,sans-serif"}}>
+                          {genBriefId===a.id?<span style={{display:"flex",alignItems:"center",gap:5}}><Spin color="#fff" size={11}/>מעדכן...</span>:"↻ עדכן תקציר לפי הערות"}
+                        </button>
+                      )}
                     </div>
                   )}
                 </div>
@@ -823,26 +884,28 @@ function ContentWriter({clientId,articleId,onBack}){
   const [publishing,setPublishing]=useState(false);
   const [published,setPublished]=useState(false);
   const [schedDate,setSchedDate]=useState(article?.scheduledDate||"");
-  const [articleInstructions,setArticleInstructions]=useState("");
-  const [showInstructions,setShowInstructions]=useState(false);
+  const [articleInstructions,setArticleInstructions]=useState(article?.notes||"");
+  const [showInstructions,setShowInstructions]=useState(!!article?.notes?.trim());
 
   const generateBrief=async()=>{
     if(!form.topic||!form.keywords){setError("נא למלא נושא ומילות מפתח");return;}
     setBriefLoading(true);setError(null);setBrief(null);setResult(null);
     try{
+      const feedback=articleInstructions.trim()||article?.notes?.trim()||"";
       const prompt=
         "Create a Hebrew SEO article brief.\n\n"+
         "Topic: "+form.topic+"\nKeywords: "+form.keywords+
         "\nIndustry: "+(form.industry||"?")+"\nLocation: "+(client?.location||"")+
         "\nArticle type: "+form.articleType+"\n"+
+        notesBlock(feedback)+
         ((client?.focusedKeywords||[]).length>0?"\nFocused keywords to integrate: "+(client.focusedKeywords).join(", ")+"\n":"")+
         "\n"+
-        'Return ONLY valid JSON: {"briefTitle":"...","angle":"...","outline":["...","...","...","...","..."],"primaryKeyword":"...","whyThisArticle":"..."}\n'+
-        "All values in Hebrew. NEVER use double-quote inside string values.";
-      const txt=await callClaude(prompt,600);
+        'Return ONLY valid JSON: {"briefTitle":"...","angle":"...","outline":["...","...","..."],"primaryKeyword":"...","whyThisArticle":"..."}\n'+
+        "Keep outline to 3 short items. All values in Hebrew. NEVER use double-quote inside string values.";
+      const txt=await callClaude(prompt,1500);
       const b=parseJSON(txt);
       setBrief(b);
-      if(articleId&&clientId){DB.updateArticle(clientId,articleId,{brief:b,status:"briefed"});}
+      if(articleId&&clientId){DB.updateArticle(clientId,articleId,{brief:b,status:"briefed",notes:feedback||article?.notes||""});}
     }catch(e){setError("שגיאה: "+e.message);}
     setBriefLoading(false);
   };
@@ -859,7 +922,8 @@ function ContentWriter({clientId,articleId,onBack}){
         (brief?"Preferred title: "+brief.briefTitle+"\nAngle: "+brief.angle+"\n":"")+
         "Type: "+tL+" | Tone: "+nL+" | Length: ~"+form.wordCount+" words\n"+
         ((client?.focusedKeywords||[]).length>0?"\nFocused keywords to prioritize: "+(client.focusedKeywords).join(", ")+"\n":"")+
-        (articleInstructions.trim()?"\nSpecial instructions: "+articleInstructions+"\n":"")+
+        notesBlock(articleInstructions.trim()||article?.notes||"")+
+        "\nCurrent year is 2026. Use 2026 in titles and content unless explicitly told otherwise.\n"+
         "\nReturn ONLY valid JSON:\n"+
         '{"title":"","metaTitle":"","metaDescription":"","slug":"","readTime":"","keywords":[],"lsiKeywords":[],"outline":[{"heading":"","subheadings":[]}],"article":"","altTexts":[],"internalLinkSuggestions":[],"seoScore":85,"seoTips":[]}';
       const txt=await callClaude(prompt,4000);
@@ -929,6 +993,12 @@ function ContentWriter({clientId,articleId,onBack}){
           <Field label="אורך" name="wordCount" value={form.wordCount} onChange={set} as="select" options={[{value:"500",label:"קצר ~500"},{value:"800",label:"סטנדרטי ~800"},{value:"1200",label:"ארוך ~1200"},{value:"1800",label:"מעמיק ~1800"}]}/>
           {!article&&<><Field label="לקוח" name="clientName" value={form.clientName} onChange={set} placeholder="שם העסק"/><Field label="דומיין" name="domain" value={form.domain} onChange={set} placeholder="example.co.il"/><Field label="תחום" name="industry" value={form.industry} onChange={set} placeholder="תחום עיסוק"/></>}
           {error&&<div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:7,padding:"8px 12px",fontSize:12,color:RED,marginBottom:9}}>{error}</div>}
+          <div style={{marginBottom:10}}>
+            <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",letterSpacing:1,marginBottom:4,textTransform:"uppercase"}}>הערות / תיקונים</div>
+            <textarea value={articleInstructions} onChange={e=>setArticleInstructions(e.target.value)}
+              placeholder="לדוגמה: שנה 2026, הדגש דגם מסוים, אל תזכיר מתחרים..."
+              rows={2} style={{width:"100%",padding:"8px 11px",border:"1.5px solid #e2e8f0",borderRadius:8,fontSize:12,fontFamily:"Heebo,sans-serif",resize:"vertical",outline:"none",boxSizing:"border-box",direction:"rtl"}}/>
+          </div>
           {!brief?(
             <button onClick={generateBrief} disabled={briefLoading||loading} style={{width:"100%",background:briefLoading?"#94a3b8":ACCENT,color:"#fff",border:"none",borderRadius:9,padding:"12px 0",fontSize:14,fontWeight:700,cursor:briefLoading?"not-allowed":"pointer",fontFamily:"Heebo,sans-serif"}}>
               {briefLoading?<span style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8}}><Spin color="#fff"/>מכין תקציר...</span>:"📋 צור תקציר"}
