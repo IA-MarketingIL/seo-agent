@@ -19,8 +19,8 @@ const TONES = [
   { value:"friendly",      label:"ידידותי וקליל" },
   { value:"authoritative", label:"סמכותי ומשכנע" },
 ];
-const STATUS_LABEL = { suggested:"מוצע", briefed:"תקציר אושר", scheduled:"מתוזמן", published:"פורסם" };
-const STATUS_COLOR = { suggested:BLUE, briefed:AMBER, scheduled:PURPLE, published:GREEN };
+const STATUS_LABEL = { suggested:"מוצע", briefed:"תקציר אושר", draft:"טיוטה", scheduled:"מתוזמן", published:"פורסם" };
+const STATUS_COLOR = { suggested:BLUE, briefed:AMBER, draft:"#0ea5e9", scheduled:PURPLE, published:GREEN };
 
 const callClaude = async (msg, maxTokens = 2000) => {
   const res = await fetch("/api/claude", {
@@ -211,7 +211,13 @@ const DB = {
     const l=this.get(), ci=l.findIndex(c=>c.id===clientId); if(ci<0)return;
     l[ci].articles=[article,...(l[ci].articles||[])]; this.save(l);
   },
+  deleteArticle(clientId, articleId) {
+    const l=this.get(), ci=l.findIndex(c=>c.id===clientId); if(ci<0)return;
+    l[ci].articles=(l[ci].articles||[]).filter(a=>a.id!==articleId);
+    this.save(l);
+  },
 };
+const hasFullArticle=(a)=>!!(a?.draftContent?.article||a?.publishedContent?.content);
 const uid = () => Math.random().toString(36).slice(2,10);
 const getActiveClients=(activeClientId)=>activeClientId?DB.get().filter(c=>c.id===activeClientId):DB.get();
 
@@ -312,6 +318,7 @@ function SiteScanner({onClientSaved}){
     setSteps([
       {icon:"🌐",text:"סורק תוכן האתר",status:"loading"},
       {icon:"🔍",text:"מנתח פרטי העסק",status:"idle"},
+      {icon:"✍",text:"לומד סגנון כתיבה",status:"idle"},
       {icon:"💡",text:"מציע מאמרים",status:"idle"},
       {icon:"🔑",text:"מחקר מילות מפתח + אודיט",status:"idle"},
     ]);
@@ -319,7 +326,7 @@ function SiteScanner({onClientSaved}){
       let pageContent="";
       try{
         const r=await fetch("https://r.jina.ai/"+u,{signal:AbortSignal.timeout(9000),headers:{"Accept":"text/plain"}});
-        if(r.ok)pageContent=(await r.text()).slice(0,3500);
+        if(r.ok)pageContent=(await r.text()).slice(0,4500);
       }catch{}
       upd(0,"done");upd(1,"loading");
 
@@ -338,11 +345,34 @@ function SiteScanner({onClientSaved}){
       if(desc)extracted.businessDescription=desc;
       upd(1,"done");upd(2,"loading");
 
+      const stylePrompt=
+        "Analyze this website's writing voice and propose a style guide for future SEO articles.\n"+
+        "URL: "+u+"\nBusiness: "+(extracted.businessName||"")+"\nIndustry: "+(extracted.industry||"")+"\n"+
+        (pageContent?"\nPage content sample:\n"+pageContent.slice(0,3500)+"\n":"")+
+        "\nReturn ONLY valid JSON:\n"+
+        '{"language":"he","toneNotes":"...","audienceNotes":"...","writingRules":"...","doNot":"...","sampleArticles":[{"title":"...","excerpt":"150-250 words sample in same voice","url":""}]}\n'+
+        "language must be he, en, or he-en. All notes in Hebrew. Infer tone from the real site. NEVER use double-quote inside string values.";
+      let styleGuide={language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]};
+      try{
+        const styleTxt=await callClaude(stylePrompt,1500);
+        const sg=parseJSON(styleTxt);
+        styleGuide={
+          language:["he","en","he-en"].includes(sg.language)?sg.language:"he",
+          toneNotes:sg.toneNotes||"",
+          audienceNotes:sg.audienceNotes||extracted.targetAudience||"",
+          writingRules:sg.writingRules||"",
+          doNot:sg.doNot||"",
+          sampleArticles:Array.isArray(sg.sampleArticles)?sg.sampleArticles.slice(0,3).map(s=>({title:s.title||"",excerpt:s.excerpt||"",url:s.url||""})):[],
+        };
+      }catch{}
+      upd(2,"done");upd(3,"loading");
+
       const suggestPrompt=
         "You are an Israeli SEO expert. Suggest 8 blog articles.\n"+
         "Industry: "+extracted.industry+"\nBusiness: "+extracted.businessName+"\nLocation: "+(extracted.location||"ישראל")+
         "\nDescription: "+(desc||extracted.businessDescription)+"\nTarget audience: "+extracted.targetAudience+
-        "\nKeywords: "+(extracted.mainKeywords||[]).join(", ")+"\n\n"+
+        "\nKeywords: "+(extracted.mainKeywords||[]).join(", ")+"\n"+
+        styleGuideBlock({styleGuide})+"\n"+
         "All 8 articles must be strictly about '"+extracted.industry+"'. Mix types.\n"+
         "Include at least 2 local articles targeting: "+(extracted.location||"האזור")+"\n\n"+
         "Return ONLY valid JSON:\n"+
@@ -351,7 +381,7 @@ function SiteScanner({onClientSaved}){
 
       const suggestTxt=await callClaude(suggestPrompt,2000);
       const suggested=parseJSON(suggestTxt);
-      upd(2,"done");upd(3,"loading");
+      upd(3,"done");upd(4,"loading");
 
       const loc=extracted.location||"ישראל";
       const kwPrompt=
@@ -375,13 +405,13 @@ function SiteScanner({onClientSaved}){
       ]);
       const kwData=parseJSON(kwTxt);
       const auditData=parseJSON(auditTxt);
-      upd(3,"done");
+      upd(4,"done");
 
       let domain=u; try{domain=new URL(u).hostname;}catch{}
       const articles=(suggested.suggestions||[]).map(s=>({
         id:uid(), title:s.title, keywords:s.keywords, type:s.type||"informational",
         reason:s.reason, priority:s.priority, status:"suggested", source:"suggested",
-        brief:null, notes:"", scheduledDate:null, publishedAt:null, slug:"",
+        brief:null, notes:"", draftContent:null, scheduledDate:null, publishedAt:null, slug:"",
       }));
 
       const client=DB.upsert({
@@ -394,6 +424,7 @@ function SiteScanner({onClientSaved}){
         scannedAt:new Date().toISOString(),
         keywordResearch:kwData.keywords||[],
         audit:auditData, articles,
+        styleGuide,
       });
 
       onClientSaved(client.id);
@@ -578,7 +609,19 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
   };
 
   const scheduleArticle=(articleId,date)=>{
-    DB.updateArticle(openId,articleId,{scheduledDate:date||null,status:date?"scheduled":(DB.getById(openId)?.articles?.find(a=>a.id===articleId)?.draftContent?"briefed":"briefed")});
+    const art=DB.getById(openId)?.articles?.find(a=>a.id===articleId);
+    if(date&&!hasFullArticle(art)){
+      alert("אפשר לתזמן רק אחרי שיש מאמר מלא (לא רק תקציר). לחץ 'כתוב מאמר מלא' קודם.");
+      return;
+    }
+    const nextStatus=date?"scheduled":(hasFullArticle(art)?"draft":"briefed");
+    DB.updateArticle(openId,articleId,{scheduledDate:date||null,status:nextStatus});
+    refresh();
+  };
+
+  const deleteArticle=(articleId)=>{
+    if(!confirm("למחוק את המאמר?"))return;
+    DB.deleteArticle(openId,articleId);
     refresh();
   };
 
@@ -750,9 +793,12 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
                       </div>
                     </div>
                     <div style={{display:"flex",gap:8,flexShrink:0,alignItems:"center",flexWrap:"wrap"}}>
-                      {a.status!=="published"&&(
+                      {a.status!=="published"&&hasFullArticle(a)&&(
                         <input type="datetime-local" value={toDatetimeLocal(a.scheduledDate)} onChange={e=>scheduleArticle(a.id,e.target.value)}
-                          style={{padding:"5px 9px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:12,color:ACCENT,outline:"none",direction:"ltr"}}/>
+                          style={{padding:"5px 9px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:12,color:ACCENT,outline:"none",direction:"ltr"}} title="תזמון ללוח פרסום"/>
+                      )}
+                      {a.status!=="published"&&!hasFullArticle(a)&&(
+                        <span style={{fontSize:11,color:"#94a3b8",background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:7,padding:"5px 9px"}}>תזמון אחרי מאמר מלא</span>
                       )}
                       {(a.draftContent||a.publishedContent)&&(
                         <button onClick={()=>setPreviewArticle(a)}
@@ -769,6 +815,10 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
                       <button onClick={()=>onWriteArticle(client.id,a.id)}
                         style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
                         {a.draftContent||a.publishedContent?"✏ ערוך מאמר":"✦ כתוב מאמר מלא"}
+                      </button>
+                      <button onClick={()=>deleteArticle(a.id)}
+                        style={{background:"#fef2f2",color:RED,border:"1px solid #fecaca",borderRadius:7,padding:"7px 10px",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+                        🗑
                       </button>
                     </div>
                   </div>
@@ -1158,7 +1208,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
           keywords:Array.isArray(parsed.keywords)?parsed.keywords.join(", "):form.keywords,
           slug:parsed.slug,
           scheduledDate:schedDate||null,
-          status:schedDate?"scheduled":"briefed",
+          status:schedDate?"scheduled":"draft",
           notes:articleInstructions.trim()||article?.notes||"",
         });
       }
@@ -1193,6 +1243,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
           keywords:Array.isArray(parsed.keywords)?parsed.keywords.join(", "):form.keywords,
           slug:parsed.slug,
           revisionNotes,
+          status:schedDate?"scheduled":"draft",
         });
       }
     }catch(e){setError("שגיאה: "+e.message);}
@@ -1413,9 +1464,10 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
                 <div>
                   <label style={{display:"block",fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4}}>תאריך ושעת פרסום</label>
                   <input type="datetime-local" value={schedDate} onChange={e=>{
-                    setSchedDate(e.target.value);
-                    if(articleId&&effectiveClientId){
-                      DB.updateArticle(effectiveClientId,articleId,{scheduledDate:e.target.value||null,status:e.target.value?"scheduled":"briefed"});
+                    const v=e.target.value;
+                    setSchedDate(v);
+                    if(articleId&&effectiveClientId&&result){
+                      DB.updateArticle(effectiveClientId,articleId,{scheduledDate:v||null,status:v?"scheduled":"draft"});
                     }
                   }} style={{padding:"7px 10px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:13,color:ACCENT,outline:"none",direction:"ltr"}}/>
                 </div>
@@ -1424,6 +1476,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
                   {revising?<span style={{display:"flex",alignItems:"center",gap:6}}><Spin color="#fff"/>משפר...</span>:"↻ שפר מאמר לפי הערות"}
                 </button>
               </div>
+              <div style={{fontSize:11,color:"#94a3b8",marginTop:8}}>המאמר נשמר אוטומטית בעמוד המאמרים גם בלי תזמון. תזמון מעביר אותו ללוח הפרסום.</div>
             </div>
           </div>
         )}
@@ -1432,21 +1485,110 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
   );
 }
 
+// ── ARTICLES LIBRARY ──────────────────────────────────────────────────────────
+function ArticlesLibrary({activeClientId,onWriteArticle}){
+  const clients=getActiveClients(activeClientId);
+  const [preview,setPreview]=useState(null);
+  const [,setTick]=useState(0);
+  const refresh=()=>setTick(t=>t+1);
+  const rows=[];
+  clients.forEach(c=>{
+    (c.articles||[]).forEach(a=>{
+      if(!hasFullArticle(a))return;
+      rows.push({clientId:c.id,clientName:c.name,article:a});
+    });
+  });
+  rows.sort((a,b)=>{
+    const da=a.article.draftContent?.generatedAt||a.article.publishedAt||a.article.scheduledDate||"";
+    const db=b.article.draftContent?.generatedAt||b.article.publishedAt||b.article.scheduledDate||"";
+    return new Date(db)-new Date(da);
+  });
+
+  const remove=(clientId,articleId)=>{
+    if(!confirm("למחוק את המאמר?"))return;
+    DB.deleteArticle(clientId,articleId);
+    setPreview(null);
+    refresh();
+  };
+
+  return(
+    <div style={{flex:1,overflowY:"auto",padding:"28px 32px",background:"#f8fafc"}}>
+      <div style={{maxWidth:960,margin:"0 auto"}}>
+        <div style={{fontSize:20,fontWeight:800,color:ACCENT,marginBottom:6}}>מאמרים</div>
+        <div style={{fontSize:13,color:"#64748b",marginBottom:18,lineHeight:1.6}}>
+          כל המאמרים המלאים שנשמרו במערכת — גם טיוטות שעדיין לא תוזמנו ללוח הפרסום.
+          {activeClientId?" · מסונן לפי: "+(DB.getById(activeClientId)?.name||""):""}
+        </div>
+        {rows.length===0?(
+          <div style={{textAlign:"center",padding:"60px 0",color:"#94a3b8",fontSize:13}}>אין מאמרים מלאים עדיין — צור מאמר במסך הכתיבה</div>
+        ):(
+          <div style={{display:"flex",flexDirection:"column",gap:10}}>
+            {rows.map(({clientId,clientName,article:a})=>(
+              <div key={clientId+"-"+a.id} style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"14px 18px"}}>
+                <div style={{display:"flex",justifyContent:"space-between",gap:12,flexWrap:"wrap",alignItems:"flex-start"}}>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:15,fontWeight:800,color:ACCENT,marginBottom:4}}>{a.draftContent?.title||a.publishedContent?.title||a.title}</div>
+                    <div style={{fontSize:12,color:"#64748b",marginBottom:8}}>{clientName}{a.keywords?" · "+a.keywords:""}</div>
+                    <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
+                      <StatusBadge status={a.status}/>
+                      {a.scheduledDate&&<span style={{fontSize:12,color:PURPLE,fontWeight:600}}>📅 {formatDateTime(a.scheduledDate)}</span>}
+                      {a.draftContent?.generatedAt&&<span style={{fontSize:11,color:"#94a3b8"}}>נשמר {formatDateTime(a.draftContent.generatedAt)}</span>}
+                    </div>
+                  </div>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                    <button onClick={()=>setPreview({clientId,article:a})} style={{background:"#f1f5f9",border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>📄 צפה</button>
+                    <button onClick={()=>onWriteArticle(clientId,a.id)} style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>✏ ערוך</button>
+                    {a.status!=="published"&&(
+                      <input type="datetime-local" value={toDatetimeLocal(a.scheduledDate)} onChange={e=>{
+                        const v=e.target.value;
+                        DB.updateArticle(clientId,a.id,{scheduledDate:v||null,status:v?"scheduled":"draft"});
+                        refresh();
+                      }} style={{padding:"5px 9px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:12,direction:"ltr"}} title="תזמן ללוח פרסום"/>
+                    )}
+                    <button onClick={()=>remove(clientId,a.id)} style={{background:"#fef2f2",color:RED,border:"1px solid #fecaca",borderRadius:7,padding:"7px 10px",fontSize:12,fontWeight:700,cursor:"pointer"}}>🗑</button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {preview&&(
+        <div style={{position:"fixed",inset:0,background:"#0f172a90",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div style={{background:"#fff",borderRadius:16,padding:"26px 28px",maxWidth:720,width:"100%",maxHeight:"85vh",overflowY:"auto",direction:"rtl"}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:14,gap:10}}>
+              <div style={{fontSize:18,fontWeight:800,color:ACCENT}}>{preview.article.draftContent?.title||preview.article.title}</div>
+              <div style={{display:"flex",gap:8}}>
+                <button onClick={()=>{onWriteArticle(preview.clientId,preview.article.id);setPreview(null);}} style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer"}}>✏ ערוך</button>
+                <button onClick={()=>setPreview(null)} style={{background:"#f1f5f9",border:"none",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>✕</button>
+              </div>
+            </div>
+            <ArticleView text={articleBody(preview.article)}/>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── CALENDAR ──────────────────────────────────────────────────────────────────
 function Calendar({activeClientId,onWriteArticle}){
   const clients=getActiveClients(activeClientId);
   const [preview,setPreview]=useState(null);
+  const [,setTick]=useState(0);
+  const refresh=()=>setTick(t=>t+1);
   const rows=[];
   clients.forEach(c=>{
     (c.articles||[]).forEach(a=>{
-      if(a.scheduledDate||a.publishedAt){
-        rows.push({
-          date:a.publishedAt||a.scheduledDate,
-          client:c.name, domain:c.domain, clientId:c.id,
-          articleId:a.id, title:a.title, status:a.status, slug:a.slug||a.draftContent?.slug,
-          article:a,
-        });
-      }
+      // Only full articles that are scheduled or published appear on the calendar
+      if(!hasFullArticle(a))return;
+      if(!(a.scheduledDate||a.publishedAt))return;
+      rows.push({
+        date:a.publishedAt||a.scheduledDate,
+        client:c.name, domain:c.domain, clientId:c.id,
+        articleId:a.id, title:a.title, status:a.status, slug:a.slug||a.draftContent?.slug,
+        article:a,
+      });
     });
   });
   rows.sort((a,b)=>{
@@ -1457,22 +1599,34 @@ function Calendar({activeClientId,onWriteArticle}){
 
   const fmt=(d)=>formatDateTime(d);
 
+  const removeFromCalendar=(clientId,articleId,hardDelete)=>{
+    if(hardDelete){
+      if(!confirm("למחוק את המאמר לגמרי מהמערכת?"))return;
+      DB.deleteArticle(clientId,articleId);
+    }else{
+      if(!confirm("להסיר מהלוח? המאמר יישאר בעמוד המאמרים כטיוטה."))return;
+      DB.updateArticle(clientId,articleId,{scheduledDate:null,status:"draft"});
+    }
+    setPreview(null);
+    refresh();
+  };
+
   return(
     <div style={{flex:1,overflowY:"auto",padding:"28px 32px",background:"#f8fafc"}}>
-      <div style={{maxWidth:900,margin:"0 auto"}}>
+      <div style={{maxWidth:960,margin:"0 auto"}}>
         <div style={{fontSize:20,fontWeight:800,color:ACCENT,fontFamily:"Heebo,sans-serif",marginBottom:8}}>לוח פרסום</div>
         {activeClientId&&<div style={{fontSize:13,color:"#64748b",marginBottom:16}}>מציג רק: {DB.getById(activeClientId)?.name}</div>}
         {rows.length===0?(
           <div style={{textAlign:"center",padding:"60px 0",color:"#94a3b8",fontSize:13,fontFamily:"Heebo,sans-serif"}}>
-            אין מאמרים מתוזמנים — אשר מאמרים וקבע תאריכי פרסום בכרטיסי הלקוחות
+            אין מאמרים מתוזמנים — צור מאמר מלא ואז קבע תאריך פרסום
           </div>
         ):(
           <div style={{background:"#fff",borderRadius:12,border:"1px solid #e2e8f0",overflow:"hidden"}}>
-            <div style={{display:"grid",gridTemplateColumns:"170px 1fr 110px 90px 100px",background:ACCENT,color:"#fff",padding:"10px 18px",gap:12,fontSize:11,fontWeight:700,letterSpacing:1,textTransform:"uppercase",fontFamily:"Heebo,sans-serif"}}>
+            <div style={{display:"grid",gridTemplateColumns:"170px 1fr 110px 90px 160px",background:ACCENT,color:"#fff",padding:"10px 18px",gap:12,fontSize:11,fontWeight:700,letterSpacing:1,textTransform:"uppercase",fontFamily:"Heebo,sans-serif"}}>
               <div>תאריך</div><div>מאמר</div><div>לקוח</div><div>סטטוס</div><div></div>
             </div>
             {rows.map((r,i)=>(
-              <div key={i} style={{display:"grid",gridTemplateColumns:"170px 1fr 110px 90px 100px",padding:"12px 18px",gap:12,borderBottom:"1px solid #f1f5f9",alignItems:"center",background:i%2===0?"#fff":"#fafafa"}}>
+              <div key={i} style={{display:"grid",gridTemplateColumns:"170px 1fr 110px 90px 160px",padding:"12px 18px",gap:12,borderBottom:"1px solid #f1f5f9",alignItems:"center",background:i%2===0?"#fff":"#fafafa"}}>
                 <div style={{fontSize:12,color:"#64748b",fontFamily:"Heebo,sans-serif"}}>{fmt(r.date)}</div>
                 <div>
                   <div style={{fontSize:13,fontWeight:600,color:ACCENT,fontFamily:"Heebo,sans-serif",lineHeight:1.4}}>{r.title}</div>
@@ -1480,10 +1634,13 @@ function Calendar({activeClientId,onWriteArticle}){
                 </div>
                 <div style={{fontSize:12,color:"#64748b",fontFamily:"Heebo,sans-serif"}}>{r.client}</div>
                 <div><StatusBadge status={r.status}/></div>
-                <div style={{display:"flex",gap:6}}>
-                  {(articleBody(r.article)||r.article?.brief)&&(
-                    <button onClick={()=>setPreview(r)} style={{background:"#f1f5f9",border:"1px solid #e2e8f0",borderRadius:6,padding:"5px 10px",fontSize:11,fontWeight:700,cursor:"pointer",color:ACCENT}}>👁 צפה</button>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  <button onClick={()=>setPreview(r)} style={{background:"#f1f5f9",border:"1px solid #e2e8f0",borderRadius:6,padding:"5px 10px",fontSize:11,fontWeight:700,cursor:"pointer",color:ACCENT}}>👁</button>
+                  <button onClick={()=>onWriteArticle?.(r.clientId,r.articleId)} style={{background:BLUE,color:"#fff",border:"none",borderRadius:6,padding:"5px 10px",fontSize:11,fontWeight:700,cursor:"pointer"}}>✏</button>
+                  {r.status!=="published"&&(
+                    <button onClick={()=>removeFromCalendar(r.clientId,r.articleId,false)} style={{background:"#fff7ed",color:AMBER,border:"1px solid #fed7aa",borderRadius:6,padding:"5px 8px",fontSize:11,fontWeight:700,cursor:"pointer"}} title="הסר מלוח">✕</button>
                   )}
+                  <button onClick={()=>removeFromCalendar(r.clientId,r.articleId,true)} style={{background:"#fef2f2",color:RED,border:"1px solid #fecaca",borderRadius:6,padding:"5px 8px",fontSize:11,fontWeight:700,cursor:"pointer"}} title="מחק לגמרי">🗑</button>
                 </div>
               </div>
             ))}
@@ -1542,7 +1699,8 @@ export default function SEOAgent(){
   };
 
   const scopedClients=getActiveClients(activeClientId);
-  const totalScheduled=scopedClients.reduce((s,c)=>s+(c.articles||[]).filter(a=>a.status==="scheduled").length,0);
+  const totalScheduled=scopedClients.reduce((s,c)=>s+(c.articles||[]).filter(a=>a.status==="scheduled"&&hasFullArticle(a)).length,0);
+  const totalDrafts=scopedClients.reduce((s,c)=>s+(c.articles||[]).filter(a=>hasFullArticle(a)).length,0);
   const activeClient=activeClientId?DB.getById(activeClientId):null;
   const allClients=DB.get();
 
@@ -1586,6 +1744,7 @@ export default function SEOAgent(){
               {key:"scan",    label:"🔍 סריקה"},
               {key:"clients", label:"👥 לקוחות", badge:scopedClients.length},
               {key:"write",   label:"✦ כתיבה"},
+              {key:"articles",label:"📄 מאמרים", badge:totalDrafts},
               {key:"calendar",label:"📅 לוח פרסום", badge:totalScheduled},
             ].map(n=><NavTab key={n.key} label={n.label} active={page===n.key} onClick={()=>{
               if(n.key==="clients"&&activeClientId)setOpenClientId(activeClientId);
@@ -1597,6 +1756,7 @@ export default function SEOAgent(){
           {page==="scan"    && <SiteScanner onClientSaved={id=>{setOpenClientId(id);setActiveClientId(id);setPage("clients");}}/>}
           {page==="clients" && <ClientManager onWriteArticle={goWrite} initialOpenId={openClientId} onSelectClient={id=>setActiveClientId(id)}/>}
           {page==="write"   && <ContentWriter clientId={writeProps?.clientId} articleId={writeProps?.articleId} activeClientId={activeClientId} onBack={()=>goClients(writeProps?.clientId||activeClientId)}/>}
+          {page==="articles"&& <ArticlesLibrary activeClientId={activeClientId} onWriteArticle={goWrite}/>}
           {page==="calendar"&& <Calendar activeClientId={activeClientId} onWriteArticle={goWrite}/>}
         </div>
       </div>
