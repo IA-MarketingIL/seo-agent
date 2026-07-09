@@ -1122,7 +1122,7 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
 }
 
 // ── CONTENT WRITER ────────────────────────────────────────────────────────────
-function ContentWriter({clientId,articleId,onBack,activeClientId}){
+function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
   const resolvedClientId=clientId||activeClientId||null;
   const client  = resolvedClientId ? DB.getById(resolvedClientId) : null;
   const article = (client?.articles||[]).find(a=>a.id===articleId)||null;
@@ -1136,6 +1136,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
   });
   const set=e=>setForm(f=>({...f,[e.target.name]:e.target.value}));
 
+  const [boundArticleId,setBoundArticleId]=useState(articleId||null);
   const [brief,setBrief]=useState(article?.brief||null);
   const [briefLoading,setBriefLoading]=useState(false);
   const [loading,setLoading]=useState(false);
@@ -1149,12 +1150,49 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
   const [showInstructions,setShowInstructions]=useState(!!article?.notes?.trim());
   const [revisionNotes,setRevisionNotes]=useState(article?.revisionNotes||{content:"",keywords:"",structure:""});
   const [revising,setRevising]=useState(false);
+  const [saveMsg,setSaveMsg]=useState("");
 
   const effectiveClientId=resolvedClientId||clientId;
 
+  const persistArticle=(parsed,extra={})=>{
+    if(!effectiveClientId){
+      throw new Error("בחר לקוח בראש המסך לפני שמירה");
+    }
+    const payload={
+      draftContent:parsed,
+      title:parsed.title||form.topic,
+      keywords:Array.isArray(parsed.keywords)?parsed.keywords.join(", "):(form.keywords||""),
+      slug:parsed.slug||"",
+      type:form.articleType||"informational",
+      notes:articleInstructions.trim()||"",
+      scheduledDate:extra.scheduledDate!==undefined?extra.scheduledDate:(schedDate||null),
+      status:extra.status||((extra.scheduledDate??schedDate)?"scheduled":"draft"),
+      ...extra,
+    };
+    let id=boundArticleId||articleId;
+    if(id){
+      DB.updateArticle(effectiveClientId,id,payload);
+    }else{
+      id=uid();
+      DB.addArticle(effectiveClientId,{
+        id,
+        reason:"נכתב במסך כתיבה",
+        priority:"high",
+        source:"write",
+        brief:brief||null,
+        publishedAt:null,
+        ...payload,
+      });
+      setBoundArticleId(id);
+    }
+    if(typeof onSaved==="function")onSaved(id);
+    return id;
+  };
+
   const generateBrief=async()=>{
     if(!form.topic||!form.keywords){setError("נא למלא נושא ומילות מפתח");return;}
-    setBriefLoading(true);setError(null);setBrief(null);setResult(null);
+    if(!effectiveClientId){setError("בחר לקוח בראש המסך לפני יצירת תקציר");return;}
+    setBriefLoading(true);setError(null);setBrief(null);setResult(null);setSaveMsg("");
     try{
       const feedback=articleInstructions.trim()||article?.notes?.trim()||"";
       const prompt=
@@ -1171,13 +1209,25 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
       const txt=await callClaude(prompt,1500);
       const b=parseJSON(txt);
       setBrief(b);
-      if(articleId&&effectiveClientId){DB.updateArticle(effectiveClientId,articleId,{brief:b,status:"briefed",notes:feedback||article?.notes||""});}
+      let id=boundArticleId||articleId;
+      if(id){
+        DB.updateArticle(effectiveClientId,id,{brief:b,status:"briefed",notes:feedback,title:form.topic,keywords:form.keywords,type:form.articleType});
+      }else{
+        id=uid();
+        DB.addArticle(effectiveClientId,{
+          id, title:form.topic, keywords:form.keywords, type:form.articleType||"informational",
+          reason:"נכתב במסך כתיבה", priority:"high", status:"briefed", source:"write",
+          brief:b, notes:feedback, draftContent:null, scheduledDate:null, publishedAt:null, slug:"",
+        });
+        setBoundArticleId(id);
+      }
     }catch(e){setError("שגיאה: "+e.message);}
     setBriefLoading(false);
   };
 
   const generate=async()=>{
-    setLoading(true);setError(null);setResult(null);
+    if(!effectiveClientId){setError("בחר לקוח בראש המסך לפני יצירת מאמר");return;}
+    setLoading(true);setError(null);setResult(null);setSaveMsg("");
     try{
       const tL=ARTICLE_TYPES.find(t=>t.value===form.articleType)?.label||"";
       const nL=TONES.find(t=>t.value===form.tone)?.label||"";
@@ -1201,17 +1251,13 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
       const txt=await callClaude(prompt,8000);
       const parsed={...parseArticleResponse(txt),generatedAt:new Date().toISOString()};
       setResult(parsed);setTab("article");
-      if(articleId&&effectiveClientId){
-        DB.updateArticle(effectiveClientId,articleId,{
-          draftContent:parsed,
-          title:parsed.title||form.topic,
-          keywords:Array.isArray(parsed.keywords)?parsed.keywords.join(", "):form.keywords,
-          slug:parsed.slug,
-          scheduledDate:schedDate||null,
-          status:schedDate?"scheduled":"draft",
-          notes:articleInstructions.trim()||article?.notes||"",
-        });
-      }
+      persistArticle(parsed,{
+        brief:brief||null,
+        scheduledDate:schedDate||null,
+        status:schedDate?"scheduled":"draft",
+        notes:articleInstructions.trim()||"",
+      });
+      setSaveMsg(schedDate?"נשמר ותוזמן ללוח הפרסום":"נשמר בעמוד המאמרים");
     }catch(e){setError("שגיאה: "+e.message);}
     setLoading(false);
   };
@@ -1220,7 +1266,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
     if(!result)return;
     const hasNotes=revisionNotes.content?.trim()||revisionNotes.keywords?.trim()||revisionNotes.structure?.trim();
     if(!hasNotes){setError("נא למלא לפחות הערה אחת לשיפור");return;}
-    setRevising(true);setError(null);
+    setRevising(true);setError(null);setSaveMsg("");
     try{
       const prompt=
         "Revise this SEO article according to the feedback. Keep the same brand voice.\n"+
@@ -1236,35 +1282,48 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
       const txt=await callClaude(prompt,8000);
       const parsed={...parseArticleResponse(txt),generatedAt:new Date().toISOString()};
       setResult(parsed);setTab("article");
-      if(articleId&&effectiveClientId){
-        DB.updateArticle(effectiveClientId,articleId,{
-          draftContent:parsed,
-          title:parsed.title||form.topic,
-          keywords:Array.isArray(parsed.keywords)?parsed.keywords.join(", "):form.keywords,
-          slug:parsed.slug,
-          revisionNotes,
-          status:schedDate?"scheduled":"draft",
-        });
-      }
+      persistArticle(parsed,{revisionNotes,status:schedDate?"scheduled":"draft",scheduledDate:schedDate||null});
+      setSaveMsg("הגרסה המשופרת נשמרה");
     }catch(e){setError("שגיאה: "+e.message);}
     setRevising(false);
   };
 
+  const saveDraft=()=>{
+    if(!result){setError("אין מאמר לשמירה");return;}
+    try{
+      persistArticle(result,{status:schedDate?"scheduled":"draft",scheduledDate:schedDate||null,revisionNotes});
+      setSaveMsg("המאמר נשמר בעמוד המאמרים");
+      setError(null);
+    }catch(e){setError(e.message);}
+  };
+
+  const saveAndSchedule=()=>{
+    if(!result){setError("אין מאמר לתזמון");return;}
+    if(!schedDate){setError("בחר תאריך ושעה לתזמון");return;}
+    try{
+      persistArticle(result,{status:"scheduled",scheduledDate:schedDate,revisionNotes});
+      setSaveMsg("המאמר נשמר ותוזמן ללוח הפרסום");
+      setError(null);
+    }catch(e){setError(e.message);}
+  };
+
   const publishArticle=async()=>{
     if(!client?.workerUrl){setError("הגדר Worker URL בהגדרות הלקוח");return;}
+    if(!result)return;
     setPublishing(true);setError(null);
     try{
+      const id=persistArticle(result,{status:schedDate?"scheduled":"draft",scheduledDate:schedDate||null});
       const now=new Date().toISOString();
       const content={title:result.title,metaTitle:result.metaTitle,metaDescription:result.metaDescription,content:result.article,keywords:result.keywords,slug:result.slug};
       await pushToWorker(client,{...content,publishedAt:now});
       setPublished(true);
-      if(articleId&&effectiveClientId){
-        const prevVersions=article?.versions||[];
-        const nextVersions=article?.publishedContent
-          ? [...prevVersions,{...article.publishedContent,publishedAt:article.publishedAt,version:prevVersions.length+1}]
-          : prevVersions;
-        DB.updateArticle(effectiveClientId,articleId,{status:"published",publishedAt:now,slug:result.slug,publishedContent:content,draftContent:result,versions:nextVersions});
-      }
+      const prev=DB.getById(effectiveClientId)?.articles?.find(a=>a.id===id);
+      const prevVersions=prev?.versions||[];
+      const nextVersions=prev?.publishedContent
+        ? [...prevVersions,{...prev.publishedContent,publishedAt:prev.publishedAt,version:prevVersions.length+1}]
+        : prevVersions;
+      DB.updateArticle(effectiveClientId,id,{status:"published",publishedAt:now,slug:result.slug,publishedContent:content,draftContent:result,versions:nextVersions});
+      setSaveMsg("פורסם לאתר הלקוח");
     }catch(e){setError("שגיאת פרסום: "+e.message);}
     setPublishing(false);
   };
@@ -1307,19 +1366,34 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
           <Field label="טון" name="tone" value={form.tone} onChange={set} as="select" options={TONES}/>
           <Field label="אורך" name="wordCount" value={form.wordCount} onChange={set} as="select" options={[{value:"500",label:"קצר ~500"},{value:"800",label:"סטנדרטי ~800"},{value:"1200",label:"ארוך ~1200"},{value:"1800",label:"מעמיק ~1800"}]}/>
           {!article&&<><Field label="לקוח" name="clientName" value={form.clientName} onChange={set} placeholder="שם העסק"/><Field label="דומיין" name="domain" value={form.domain} onChange={set} placeholder="example.co.il"/><Field label="תחום" name="industry" value={form.industry} onChange={set} placeholder="תחום עיסוק"/></>}
+          {!effectiveClientId&&(
+            <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,padding:"8px 12px",marginBottom:12,fontSize:12,color:"#92400e",lineHeight:1.6}}>
+              בחר לקוח בראש המסך כדי לשמור ולתזמן מאמרים
+            </div>
+          )}
           {error&&<div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:7,padding:"8px 12px",fontSize:12,color:RED,marginBottom:9}}>{error}</div>}
+          {saveMsg&&<div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:7,padding:"8px 12px",fontSize:12,color:GREEN,marginBottom:9}}>✓ {saveMsg}</div>}
           <div style={{marginBottom:10}}>
             <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",letterSpacing:1,marginBottom:4,textTransform:"uppercase"}}>הערות / תיקונים</div>
             <textarea value={articleInstructions} onChange={e=>setArticleInstructions(e.target.value)}
               placeholder="לדוגמה: שנה 2026, הדגש דגם מסוים, אל תזכיר מתחרים..."
               rows={2} style={{width:"100%",padding:"8px 11px",border:"1.5px solid #e2e8f0",borderRadius:8,fontSize:12,fontFamily:"Heebo,sans-serif",resize:"vertical",outline:"none",boxSizing:"border-box",direction:"rtl"}}/>
           </div>
+          {result&&(
+            <div style={{marginBottom:12}}>
+              <label style={{display:"block",fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4}}>תאריך ושעת פרסום</label>
+              <input type="datetime-local" value={schedDate} onChange={e=>setSchedDate(e.target.value)}
+                style={{width:"100%",padding:"8px 10px",border:"1.5px solid #e2e8f0",borderRadius:8,fontSize:13,color:ACCENT,outline:"none",direction:"ltr",boxSizing:"border-box",marginBottom:8}}/>
+              <button onClick={saveDraft} style={{width:"100%",background:ACCENT,color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:13,fontWeight:700,cursor:"pointer",marginBottom:6}}>💾 שמור מאמר</button>
+              <button onClick={saveAndSchedule} style={{width:"100%",background:PURPLE,color:"#fff",border:"none",borderRadius:8,padding:"10px 0",fontSize:13,fontWeight:700,cursor:"pointer"}}>📅 שמור ותזמן</button>
+            </div>
+          )}
           {!brief?(
             <button onClick={generateBrief} disabled={briefLoading||loading} style={{width:"100%",background:briefLoading?"#94a3b8":ACCENT,color:"#fff",border:"none",borderRadius:9,padding:"12px 0",fontSize:14,fontWeight:700,cursor:briefLoading?"not-allowed":"pointer",fontFamily:"Heebo,sans-serif"}}>
               {briefLoading?<span style={{display:"flex",alignItems:"center",justifyContent:"center",gap:8}}><Spin color="#fff"/>מכין תקציר...</span>:"📋 צור תקציר"}
             </button>
           ):(
-            <button onClick={()=>{setBrief(null);setResult(null);setPublished(false);}} style={{width:"100%",background:"#f1f5f9",color:ACCENT,border:"1.5px solid #e2e8f0",borderRadius:9,padding:"12px 0",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>← שנה כיוון</button>
+            <button onClick={()=>{setBrief(null);setResult(null);setPublished(false);setSaveMsg("");}} style={{width:"100%",background:"#f1f5f9",color:ACCENT,border:"1.5px solid #e2e8f0",borderRadius:9,padding:"12px 0",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>← שנה כיוון</button>
           )}
         </div>
       </div>
@@ -1394,6 +1468,8 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
               <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
                 <ScoreBadge score={result.seoScore}/>
                 <span style={{fontSize:12,color:"#64748b"}}>⏱ {result.readTime}</span>
+                <button onClick={saveDraft} style={{background:ACCENT,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer"}}>💾 שמור מאמר</button>
+                <button onClick={saveAndSchedule} style={{background:PURPLE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer"}}>📅 שמור ותזמן</button>
                 <button onClick={exportReport} style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>⬇ ייצוא</button>
                 {client?.workerUrl&&!published&&(
                   <button onClick={publishArticle} disabled={publishing} style={{background:publishing?"#94a3b8":GREEN,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:publishing?"not-allowed":"pointer",fontFamily:"Heebo,sans-serif"}}>
@@ -1402,6 +1478,17 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
                 )}
                 {published&&<span style={{background:"#f0fdf4",border:"1px solid #bbf7d0",color:GREEN,borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700}}>✓ פורסם!</span>}
               </div>
+            </div>
+            {saveMsg&&<div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:8,padding:"8px 12px",marginBottom:14,fontSize:12,color:GREEN,fontWeight:600}}>✓ {saveMsg}</div>}
+            {!effectiveClientId&&<div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,padding:"8px 12px",marginBottom:14,fontSize:12,color:"#92400e"}}>בחר לקוח בראש המסך כדי לשמור ולתזמן את המאמר</div>}
+            <div style={{display:"flex",gap:10,alignItems:"flex-end",flexWrap:"wrap",marginBottom:16,background:"#fff",border:"1px solid #e2e8f0",borderRadius:10,padding:"12px 14px"}}>
+              <div>
+                <label style={{display:"block",fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4}}>תאריך ושעת פרסום</label>
+                <input type="datetime-local" value={schedDate} onChange={e=>setSchedDate(e.target.value)}
+                  style={{padding:"7px 10px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:13,color:ACCENT,outline:"none",direction:"ltr"}}/>
+              </div>
+              <button onClick={saveDraft} style={{background:ACCENT,color:"#fff",border:"none",borderRadius:8,padding:"9px 16px",fontSize:13,fontWeight:700,cursor:"pointer"}}>💾 שמור בעמוד מאמרים</button>
+              <button onClick={saveAndSchedule} style={{background:PURPLE,color:"#fff",border:"none",borderRadius:8,padding:"9px 16px",fontSize:13,fontWeight:700,cursor:"pointer"}}>📅 שמור ותזמן ללוח</button>
             </div>
             <div style={{display:"flex",gap:3,background:"#f1f5f9",borderRadius:8,padding:3,marginBottom:18,width:"fit-content"}}>
               {tabs.map(t=><button key={t.key} onClick={()=>setTab(t.key)} style={{padding:"6px 13px",borderRadius:6,border:"none",fontFamily:"Heebo,sans-serif",fontSize:12,fontWeight:600,cursor:"pointer",background:tab===t.key?ACCENT:"transparent",color:tab===t.key?"#fff":"#64748b"}}>{t.label}</button>)}
@@ -1461,22 +1548,14 @@ function ContentWriter({clientId,articleId,onBack,activeClientId}){
               <Field label="הערות למילות מפתח" name="rk" value={revisionNotes.keywords||""} onChange={e=>setRevisionNotes(n=>({...n,keywords:e.target.value}))} multiline rows={2} placeholder="הוסף 'טרקטורונים חדרה', הסר..."/>
               <Field label="הערות למבנה" name="rs" value={revisionNotes.structure||""} onChange={e=>setRevisionNotes(n=>({...n,structure:e.target.value}))} multiline rows={2} placeholder="הוסף H2 על תחזוקה, הסר סעיף על..."/>
               <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap",marginTop:4}}>
-                <div>
-                  <label style={{display:"block",fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4}}>תאריך ושעת פרסום</label>
-                  <input type="datetime-local" value={schedDate} onChange={e=>{
-                    const v=e.target.value;
-                    setSchedDate(v);
-                    if(articleId&&effectiveClientId&&result){
-                      DB.updateArticle(effectiveClientId,articleId,{scheduledDate:v||null,status:v?"scheduled":"draft"});
-                    }
-                  }} style={{padding:"7px 10px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:13,color:ACCENT,outline:"none",direction:"ltr"}}/>
-                </div>
+                <button onClick={saveDraft} style={{background:ACCENT,color:"#fff",border:"none",borderRadius:9,padding:"12px 18px",fontSize:13,fontWeight:700,cursor:"pointer"}}>💾 שמור מאמר</button>
+                <button onClick={saveAndSchedule} style={{background:PURPLE,color:"#fff",border:"none",borderRadius:9,padding:"12px 18px",fontSize:13,fontWeight:700,cursor:"pointer"}}>📅 שמור ותזמן</button>
                 <button onClick={regenerateArticle} disabled={revising}
                   style={{background:revising?"#94a3b8":AMBER,color:"#fff",border:"none",borderRadius:9,padding:"12px 18px",fontSize:13,fontWeight:700,cursor:revising?"not-allowed":"pointer"}}>
                   {revising?<span style={{display:"flex",alignItems:"center",gap:6}}><Spin color="#fff"/>משפר...</span>:"↻ שפר מאמר לפי הערות"}
                 </button>
               </div>
-              <div style={{fontSize:11,color:"#94a3b8",marginTop:8}}>המאמר נשמר אוטומטית בעמוד המאמרים גם בלי תזמון. תזמון מעביר אותו ללוח הפרסום.</div>
+              <div style={{fontSize:11,color:"#94a3b8",marginTop:8}}>שמירה מעבירה לעמוד המאמרים. תזמון דורש תאריך ושעה למעלה ומעביר גם ללוח הפרסום.</div>
             </div>
           </div>
         )}
@@ -1755,7 +1834,7 @@ export default function SEOAgent(){
         <div style={{display:"flex",flex:1,overflow:"hidden"}}>
           {page==="scan"    && <SiteScanner onClientSaved={id=>{setOpenClientId(id);setActiveClientId(id);setPage("clients");}}/>}
           {page==="clients" && <ClientManager onWriteArticle={goWrite} initialOpenId={openClientId} onSelectClient={id=>setActiveClientId(id)}/>}
-          {page==="write"   && <ContentWriter clientId={writeProps?.clientId} articleId={writeProps?.articleId} activeClientId={activeClientId} onBack={()=>goClients(writeProps?.clientId||activeClientId)}/>}
+          {page==="write"   && <ContentWriter clientId={writeProps?.clientId} articleId={writeProps?.articleId} activeClientId={activeClientId} onBack={()=>goClients(writeProps?.clientId||activeClientId)} onSaved={()=>refreshNav()}/>}
           {page==="articles"&& <ArticlesLibrary activeClientId={activeClientId} onWriteArticle={goWrite}/>}
           {page==="calendar"&& <Calendar activeClientId={activeClientId} onWriteArticle={goWrite}/>}
         </div>
