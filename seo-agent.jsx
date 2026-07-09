@@ -113,6 +113,59 @@ const parseArticleResponse = (txt) => {
 
 const notesBlock=(notes)=>notes?.trim()?"\nClient feedback / corrections (MUST follow):\n"+notes.trim()+"\n":"";
 
+const LANG_LABEL={he:"Hebrew",en:"English","he-en":"Hebrew with some English terms"};
+const toDatetimeLocal=(v)=>{
+  if(!v)return"";
+  const s=String(v);
+  if(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(s))return s.slice(0,16);
+  if(/^\d{4}-\d{2}-\d{2}$/.test(s))return s+"T09:00";
+  try{const d=new Date(s);if(isNaN(d))return"";const p=n=>String(n).padStart(2,"0");return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;}catch{return"";}
+};
+const formatDateTime=(d)=>{
+  if(!d)return"";
+  try{
+    const dt=new Date(d);
+    if(isNaN(dt))return String(d);
+    const hasTime=/T\d{2}:\d{2}/.test(String(d))||String(d).includes(":");
+    return dt.toLocaleString("he-IL",{day:"numeric",month:"long",year:"numeric",...(hasTime?{hour:"2-digit",minute:"2-digit"}:{})});
+  }catch{return String(d);}
+};
+const styleGuideBlock=(client)=>{
+  const sg=client?.styleGuide;
+  if(!sg)return"";
+  let out="\n=== CLIENT STYLE GUIDE (MUST MATCH — do not invent a new brand voice) ===\n";
+  out+="Language: "+(LANG_LABEL[sg.language]||sg.language||"Hebrew")+"\n";
+  if(sg.toneNotes?.trim())out+="Tone: "+sg.toneNotes.trim()+"\n";
+  if(sg.audienceNotes?.trim())out+="Audience: "+sg.audienceNotes.trim()+"\n";
+  if(sg.writingRules?.trim())out+="Writing rules: "+sg.writingRules.trim()+"\n";
+  if(sg.doNot?.trim())out+="Do NOT: "+sg.doNot.trim()+"\n";
+  const samples=(sg.sampleArticles||[]).filter(s=>s?.excerpt?.trim()||s?.title?.trim()).slice(0,5);
+  if(samples.length){
+    out+="Sample articles from this site (match this voice):\n";
+    let budget=1500;
+    for(const s of samples){
+      const chunk=((s.title?"Title: "+s.title+"\n":"")+(s.excerpt||"")).slice(0,Math.min(400,budget));
+      if(!chunk.trim())continue;
+      out+=chunk+"\n---\n";
+      budget-=chunk.length;
+      if(budget<=0)break;
+    }
+  }
+  out+="Hard rule: Match the client's existing site voice and look-and-feel. Do NOT invent a new brand style.\n";
+  return out;
+};
+const seoFocusBlock=(client)=>{
+  const f=client?.seoFocus;
+  if(!f)return"";
+  let out="\n=== SEO TIP FOCUS (MUST FOLLOW) ===\n";
+  if(f.tipNotes?.trim())out+="Focus: "+f.tipNotes.trim()+"\n";
+  if(f.priorities?.trim())out+="Priorities: "+f.priorities.trim()+"\n";
+  if(f.avoidTips?.trim())out+="Avoid suggesting: "+f.avoidTips.trim()+"\n";
+  out+="Hard rule: Do not suggest redesigning the site, changing brand voice, colors, or navigation structure. Prefer content/meta/technical fixes that preserve the existing look and feel.\n";
+  return out;
+};
+const articleBody=(a)=>a?.draftContent?.article||a?.publishedContent?.content||"";
+
 // ── DATA LAYER ────────────────────────────────────────────────────────────────
 // localStorage stays the synchronous source of truth for rendering; every write
 // is also mirrored to Supabase (debounced) so data survives cache clears and is
@@ -160,6 +213,7 @@ const DB = {
   },
 };
 const uid = () => Math.random().toString(36).slice(2,10);
+const getActiveClients=(activeClientId)=>activeClientId?DB.get().filter(c=>c.id===activeClientId):DB.get();
 
 // ── UI PRIMITIVES ─────────────────────────────────────────────────────────────
 function Spin({size=16,color=BLUE}){
@@ -376,18 +430,22 @@ function SiteScanner({onClientSaved}){
 }
 
 // ── CLIENT MANAGER ────────────────────────────────────────────────────────────
-function ClientManager({onWriteArticle,initialOpenId}){
+function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
   const [clients,setClients]=useState(DB.get());
   const [openId,setOpenId]=useState(initialOpenId||null);
   const [cardTab,setCardTab]=useState("articles");
   const [customDir,setCustomDir]=useState("");
   const [addingCustom,setAddingCustom]=useState(false);
   const [genBriefId,setGenBriefId]=useState(null);
+  const [previewArticle,setPreviewArticle]=useState(null);
+  const [regenTipsLoading,setRegenTipsLoading]=useState(false);
   const initialClient=initialOpenId?DB.getById(initialOpenId):null;
   const [focusedKeywords,setFocusedKeywords]=useState(initialClient?.focusedKeywords||[]);
   const [fixModal,setFixModal]=useState(null);
   const [versionsModal,setVersionsModal]=useState(null);
   const [reverting,setReverting]=useState(false);
+  const [styleGuide,setStyleGuide]=useState(initialClient?.styleGuide||{language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]});
+  const [seoFocus,setSeoFocus]=useState(initialClient?.seoFocus||{tipNotes:"",avoidTips:"",priorities:""});
   const refresh=()=>setClients(DB.get());
 
   const client=openId?DB.getById(openId):null;
@@ -396,12 +454,27 @@ function ClientManager({onWriteArticle,initialOpenId}){
   const [workerUrl,setWorkerUrl]=useState(initialClient?.workerUrl||"");
   const [token,setToken]=useState(initialClient?.token||"");
 
+  useEffect(()=>{
+    if(initialOpenId){
+      const c=DB.getById(initialOpenId);
+      setOpenId(initialOpenId);
+      setWorkerUrl(c?.workerUrl||"");
+      setToken(c?.token||"");
+      setFocusedKeywords(c?.focusedKeywords||[]);
+      setStyleGuide(c?.styleGuide||{language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]});
+      setSeoFocus(c?.seoFocus||{tipNotes:"",avoidTips:"",priorities:""});
+    }
+  },[initialOpenId]);
+
   const openCard=(id)=>{
     const c=DB.getById(id);
     setWorkerUrl(c?.workerUrl||"");
     setToken(c?.token||"");
     setFocusedKeywords(c?.focusedKeywords||[]);
+    setStyleGuide(c?.styleGuide||{language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]});
+    setSeoFocus(c?.seoFocus||{tipNotes:"",avoidTips:"",priorities:""});
     setOpenId(id); setCardTab("articles");
+    onSelectClient?.(id);
   };
 
   const saveSettings=()=>{
@@ -427,9 +500,11 @@ function ClientManager({onWriteArticle,initialOpenId}){
       const prompt=
         "You are an SEO technical expert. Generate a specific, actionable fix for this SEO issue.\n"+
         "Website: "+c.url+"\nBusiness: "+c.name+"\nIndustry: "+c.industry+"\n"+
-        "Issue: "+item.label+"\nDetail: "+(item.detail||"")+"\nCurrent value: "+(item.value||"")+"\n\n"+
+        "Issue: "+item.label+"\nDetail: "+(item.detail||"")+"\nCurrent value: "+(item.value||"")+"\n"+
+        styleGuideBlock(c)+seoFocusBlock(c)+
+        "\n"+
         'Return ONLY valid JSON: {"fixTitle":"...","codeSnippet":"...","language":"html","instructions":"...","estimatedImpact":"low|medium|high"}\n'+
-        "instructions must be in Hebrew. codeSnippet is the exact code to copy-paste. NEVER use double-quote inside string values.";
+        "instructions must be in Hebrew. codeSnippet is the exact code to copy-paste. NEVER use double-quote inside string values. Do not suggest redesigning the site.";
       const txt=await callClaude(prompt,800);
       const fix=parseJSON(txt);
       setFixModal(m=>({...m,loading:false,fix}));
@@ -480,19 +555,20 @@ function ClientManager({onWriteArticle,initialOpenId}){
     try{
       const c=DB.getById(openId);
       const prompt=
-        "Create a Hebrew SEO article brief based on this custom direction.\n\n"+
+        "Create an SEO article brief based on this custom direction.\n\n"+
         "Custom direction: "+customDir+"\n"+
         "Industry: "+c.industry+"\nLocation: "+(c.location||"ישראל")+"\nBusiness: "+c.name+"\nKeywords: "+(c.mainKeywords||[]).join(", ")+"\n"+
-        ((c.focusedKeywords||[]).length>0?"Focused keywords to integrate: "+c.focusedKeywords.join(", ")+"\n":"")+"\n"+
+        ((c.focusedKeywords||[]).length>0?"Focused keywords to integrate: "+c.focusedKeywords.join(", ")+"\n":"")+
+        styleGuideBlock(c)+"\n"+
         'Return ONLY valid JSON: {"title":"...","keywords":"...","type":"informational","brief":{"briefTitle":"...","angle":"...","outline":["...","...","..."],"primaryKeyword":"...","whyThisArticle":"..."}}\n'+
-        "Keep outline to 3 short items. All values in Hebrew. NEVER use double-quote inside string values.";
+        "Keep outline to 3 short items. Write values in the client's language. NEVER use double-quote inside string values.";
       const txt=await callClaude(prompt,1500);
       const data=parseJSON(txt);
       const article={
         id:uid(), title:data.title||customDir, keywords:data.keywords||"",
         type:data.type||"informational", reason:"מאמר מותאם אישית", priority:"high",
         status:"briefed", source:"custom", brief:data.brief||null, notes:"",
-        scheduledDate:null, publishedAt:null, slug:"",
+        draftContent:null, scheduledDate:null, publishedAt:null, slug:"",
       };
       DB.addArticle(openId,article);
       setCustomDir("");
@@ -502,7 +578,7 @@ function ClientManager({onWriteArticle,initialOpenId}){
   };
 
   const scheduleArticle=(articleId,date)=>{
-    DB.updateArticle(openId,articleId,{scheduledDate:date,status:date?"scheduled":"briefed"});
+    DB.updateArticle(openId,articleId,{scheduledDate:date||null,status:date?"scheduled":(DB.getById(openId)?.articles?.find(a=>a.id===articleId)?.draftContent?"briefed":"briefed")});
     refresh();
   };
 
@@ -511,20 +587,53 @@ function ClientManager({onWriteArticle,initialOpenId}){
     refresh();
   };
 
+  const saveStyleGuide=()=>{
+    DB.update(openId,{styleGuide});
+    refresh();
+  };
+
+  const saveSeoFocus=()=>{
+    DB.update(openId,{seoFocus});
+    refresh();
+  };
+
+  const regenerateFocusedTips=async()=>{
+    if(!openId)return;
+    setRegenTipsLoading(true);
+    try{
+      const c=DB.getById(openId);
+      const prompt=
+        "You are an Israeli SEO consultant. Refine SEO tips for this client.\n"+
+        "Business: "+c.name+" | URL: "+c.url+" | Industry: "+c.industry+"\n"+
+        "Current top issues: "+JSON.stringify(c.audit?.topIssues||[])+"\n"+
+        "Current quick wins: "+JSON.stringify(c.audit?.quickWins||[])+"\n"+
+        styleGuideBlock(c)+seoFocusBlock(c)+
+        "\nReturn ONLY valid JSON: {\"topIssues\":[\"...\",\"...\",\"...\"],\"quickWins\":[\"...\",\"...\",\"...\"],\"focusedTips\":[\"...\"]}\n"+
+        "All strings in Hebrew. Keep 3-5 items each. NEVER use double-quote inside string values.";
+      const txt=await callClaude(prompt,1200);
+      const data=parseJSON(txt);
+      const audit={...(c.audit||{}),topIssues:data.topIssues||c.audit?.topIssues,quickWins:data.quickWins||c.audit?.quickWins,focusedTips:data.focusedTips||[]};
+      DB.update(openId,{audit,seoFocus});
+      refresh();
+    }catch(e){alert("שגיאה: "+e.message);}
+    setRegenTipsLoading(false);
+  };
+
   const regenerateBriefFromNotes=async(article)=>{
     if(!openId||!article)return;
     setGenBriefId(article.id);
     try{
       const c=DB.getById(openId);
       const prompt=
-        "Create a Hebrew SEO article brief.\n\n"+
+        "Create an SEO article brief.\n\n"+
         "Topic: "+article.title+"\nKeywords: "+(article.keywords||"")+
         "\nIndustry: "+(c.industry||"")+"\nLocation: "+(c.location||"")+
         "\nArticle type: "+(article.type||"informational")+
         notesBlock(article.notes)+
         ((c.focusedKeywords||[]).length>0?"\nFocused keywords: "+c.focusedKeywords.join(", ")+"\n":"")+
+        styleGuideBlock(c)+
         "\nReturn ONLY valid JSON: {\"briefTitle\":\"...\",\"angle\":\"...\",\"outline\":[\"...\",\"...\",\"...\"],\"primaryKeyword\":\"...\",\"whyThisArticle\":\"...\"}\n"+
-        "Keep outline to 3 short items. All values in Hebrew. NEVER use double-quote inside string values.";
+        "Keep outline to 3 short items. Write in the client's language. NEVER use double-quote inside string values.";
       const txt=await callClaude(prompt,1500);
       const b=parseJSON(txt);
       DB.updateArticle(openId,article.id,{brief:b,status:"briefed"});
@@ -533,10 +642,7 @@ function ClientManager({onWriteArticle,initialOpenId}){
     setGenBriefId(null);
   };
 
-  const formatDate=(d)=>{
-    if(!d)return"";
-    try{return new Date(d).toLocaleDateString("he-IL");}catch{return d;}
-  };
+  const formatDate=(d)=>formatDateTime(d);
 
   // list view
   if(!openId){
@@ -604,7 +710,7 @@ function ClientManager({onWriteArticle,initialOpenId}){
 
       {/* inner tabs */}
       <div style={{background:"#fff",borderBottom:"1px solid #e2e8f0",padding:"0 24px",display:"flex",gap:2,flexShrink:0}}>
-        {[["articles","📝 מאמרים"],["keywords","🔑 מילות מפתח"],["audit","🛡 אודיט"],["settings","⚙ הגדרות"]].map(([k,l])=>(
+        {[["articles","📝 מאמרים"],["style","✍ סגנון כתיבה"],["keywords","🔑 מילות מפתח"],["audit","🛡 אודיט"],["settings","⚙ הגדרות"]].map(([k,l])=>(
           <button key={k} onClick={()=>setCardTab(k)} style={{padding:"10px 16px",border:"none",borderBottom:cardTab===k?`2px solid ${BLUE}`:"2px solid transparent",background:"transparent",fontSize:13,fontWeight:cardTab===k?700:400,color:cardTab===k?BLUE:"#64748b",cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>{l}</button>
         ))}
       </div>
@@ -622,7 +728,7 @@ function ClientManager({onWriteArticle,initialOpenId}){
                 multiline rows={2}/>
               <button onClick={addCustomArticle} disabled={addingCustom||!customDir.trim()}
                 style={{background:addingCustom?"#94a3b8":ACCENT,color:"#fff",border:"none",borderRadius:8,padding:"9px 18px",fontSize:13,fontWeight:700,cursor:addingCustom?"not-allowed":"pointer",fontFamily:"Heebo,sans-serif"}}>
-                {addingCustom?<span style={{display:"flex",alignItems:"center",gap:6}}><Spin color="#fff" size={13}/>יוצר...</span>:"+ צור מאמר"}
+                {addingCustom?<span style={{display:"flex",alignItems:"center",gap:6}}><Spin color="#fff" size={13}/>יוצר...</span>:"+ צור תקציר"}
               </button>
             </div>
 
@@ -638,34 +744,32 @@ function ClientManager({onWriteArticle,initialOpenId}){
                       <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
                         <StatusBadge status={a.status}/>
                         {a.source==="custom"&&<span style={{background:"#fdf4ff",color:PURPLE,border:`1px solid ${PURPLE}35`,borderRadius:20,padding:"2px 9px",fontSize:10,fontWeight:700}}>מותאם</span>}
+                        {a.draftContent&&<span style={{background:GREEN+"14",color:GREEN,border:`1px solid ${GREEN}35`,borderRadius:20,padding:"2px 9px",fontSize:10,fontWeight:700}}>יש טיוטה</span>}
                         {a.scheduledDate&&<span style={{fontSize:12,color:PURPLE,fontWeight:600}}>📅 {formatDate(a.scheduledDate)}</span>}
                         {a.publishedAt&&<span style={{fontSize:12,color:GREEN,fontWeight:600}}>✓ פורסם {formatDate(a.publishedAt)}</span>}
                       </div>
                     </div>
                     <div style={{display:"flex",gap:8,flexShrink:0,alignItems:"center",flexWrap:"wrap"}}>
-                      {a.status!=="published"?(
-                        <>
-                          <input type="date" value={a.scheduledDate||""} onChange={e=>scheduleArticle(a.id,e.target.value)}
-                            style={{padding:"5px 9px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:12,color:ACCENT,outline:"none",direction:"ltr"}}/>
-                          <button onClick={()=>onWriteArticle(client.id,a.id)}
-                            style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
-                            ✦ כתוב
-                          </button>
-                        </>
-                      ):(
-                        <>
-                          {(a.versions||[]).length>0&&(
-                            <button onClick={()=>setVersionsModal({article:a})}
-                              style={{background:"#f1f5f9",color:"#64748b",border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
-                              🕐 היסטוריה ({a.versions.length})
-                            </button>
-                          )}
-                          <button onClick={()=>onWriteArticle(client.id,a.id)}
-                            style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
-                            ✏ עדכן מאמר
-                          </button>
-                        </>
+                      {a.status!=="published"&&(
+                        <input type="datetime-local" value={toDatetimeLocal(a.scheduledDate)} onChange={e=>scheduleArticle(a.id,e.target.value)}
+                          style={{padding:"5px 9px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:12,color:ACCENT,outline:"none",direction:"ltr"}}/>
                       )}
+                      {(a.draftContent||a.publishedContent)&&(
+                        <button onClick={()=>setPreviewArticle(a)}
+                          style={{background:"#f1f5f9",color:ACCENT,border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
+                          📄 צפה
+                        </button>
+                      )}
+                      {(a.versions||[]).length>0&&a.status==="published"&&(
+                        <button onClick={()=>setVersionsModal({article:a})}
+                          style={{background:"#f1f5f9",color:"#64748b",border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
+                          🕐 היסטוריה ({a.versions.length})
+                        </button>
+                      )}
+                      <button onClick={()=>onWriteArticle(client.id,a.id)}
+                        style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
+                        {a.draftContent||a.publishedContent?"✏ ערוך מאמר":"✦ כתוב מאמר מלא"}
+                      </button>
                     </div>
                   </div>
                   {a.reason&&!a.brief&&(
@@ -693,6 +797,39 @@ function ClientManager({onWriteArticle,initialOpenId}){
                   )}
                 </div>
               ))}
+            </div>
+          </div>
+        )}
+
+        {/* ── STYLE GUIDE TAB ── */}
+        {cardTab==="style"&&(
+          <div style={{maxWidth:700}}>
+            <div style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"18px 22px",marginBottom:14}}>
+              <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",letterSpacing:1.5,marginBottom:12,textTransform:"uppercase"}}>סגנון כתיבה ללקוח</div>
+              <div style={{background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:8,padding:"10px 14px",marginBottom:14,fontSize:12,color:"#1e40af",lineHeight:1.7}}>
+                ההנחיות והדוגמאות כאן יוזרקו לכל כתיבת מאמרים — כדי לשמור על קו האתר הקיים.
+              </div>
+              <Field label="שפה" name="lang" value={styleGuide.language||"he"} onChange={e=>setStyleGuide(s=>({...s,language:e.target.value}))} as="select"
+                options={[{value:"he",label:"עברית"},{value:"en",label:"English"},{value:"he-en",label:"עברית + מונחים באנגלית"}]}/>
+              <Field label="טון כתיבה" name="toneN" value={styleGuide.toneNotes||""} onChange={e=>setStyleGuide(s=>({...s,toneNotes:e.target.value}))} multiline rows={2} placeholder="ידידותי אבל מקצועי, בלי סלנג..."/>
+              <Field label="קהל יעד" name="audN" value={styleGuide.audienceNotes||""} onChange={e=>setStyleGuide(s=>({...s,audienceNotes:e.target.value}))} multiline rows={2} placeholder="בעלי מוסכים / חובבי שטח..."/>
+              <Field label="כללי כתיבה" name="wr" value={styleGuide.writingRules||""} onChange={e=>setStyleGuide(s=>({...s,writingRules:e.target.value}))} multiline rows={3} placeholder="תמיד להזכיר אחריות יבואן, לא להשוות למתחרים..."/>
+              <Field label="מה לא לעשות" name="dn" value={styleGuide.doNot||""} onChange={e=>setStyleGuide(s=>({...s,doNot:e.target.value}))} multiline rows={2} placeholder="אל תשתמש במילה זול, אל תבטיח הנחות..."/>
+              <div style={{fontSize:12,fontWeight:700,color:"#64748b",margin:"14px 0 8px"}}>דוגמאות מאמרים מהאתר</div>
+              {(styleGuide.sampleArticles||[]).map((s,i)=>(
+                <div key={i} style={{border:"1px solid #e2e8f0",borderRadius:10,padding:"12px 14px",marginBottom:10}}>
+                  <Field label="כותרת" name={"st"+i} value={s.title||""} onChange={e=>{const arr=[...(styleGuide.sampleArticles||[])];arr[i]={...arr[i],title:e.target.value};setStyleGuide(g=>({...g,sampleArticles:arr}));}}/>
+                  <Field label="URL (אופציונלי)" name={"su"+i} value={s.url||""} onChange={e=>{const arr=[...(styleGuide.sampleArticles||[])];arr[i]={...arr[i],url:e.target.value};setStyleGuide(g=>({...g,sampleArticles:arr}));}} ltr/>
+                  <Field label="קטע לדוגמה" name={"se"+i} value={s.excerpt||""} onChange={e=>{const arr=[...(styleGuide.sampleArticles||[])];arr[i]={...arr[i],excerpt:e.target.value};setStyleGuide(g=>({...g,sampleArticles:arr}));}} multiline rows={4} placeholder="הדבק 200–800 מילים ממאמר קיים..."/>
+                  <button onClick={()=>setStyleGuide(g=>({...g,sampleArticles:(g.sampleArticles||[]).filter((_,j)=>j!==i)}))}
+                    style={{background:"#fef2f2",color:RED,border:"1px solid #fecaca",borderRadius:7,padding:"5px 12px",fontSize:11,fontWeight:700,cursor:"pointer"}}>מחק דוגמה</button>
+                </div>
+              ))}
+              {(styleGuide.sampleArticles||[]).length<5&&(
+                <button onClick={()=>setStyleGuide(g=>({...g,sampleArticles:[...(g.sampleArticles||[]),{title:"",excerpt:"",url:""}]}))}
+                  style={{background:"#f1f5f9",color:ACCENT,border:"1.5px solid #e2e8f0",borderRadius:8,padding:"8px 14px",fontSize:12,fontWeight:700,cursor:"pointer",marginBottom:12}}>+ הוסף דוגמה</button>
+              )}
+              <button onClick={saveStyleGuide} style={{background:BLUE,color:"#fff",border:"none",borderRadius:8,padding:"10px 20px",fontSize:13,fontWeight:700,cursor:"pointer"}}>שמור סגנון</button>
             </div>
           </div>
         )}
@@ -768,6 +905,19 @@ function ClientManager({onWriteArticle,initialOpenId}){
         {/* ── AUDIT TAB ── */}
         {cardTab==="audit"&&(
           <div style={{maxWidth:700}}>
+            <div style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"16px 20px",marginBottom:14}}>
+              <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",letterSpacing:1.5,marginBottom:10,textTransform:"uppercase"}}>מיקוד לטיפים</div>
+              <Field label="על מה להתמקד" name="tn" value={seoFocus.tipNotes||""} onChange={e=>setSeoFocus(f=>({...f,tipNotes:e.target.value}))} multiline rows={2} placeholder="תתמקד במהירות מובייל וב-Core Web Vitals, פחות ב-schema"/>
+              <Field label="עדיפויות" name="pr" value={seoFocus.priorities||""} onChange={e=>setSeoFocus(f=>({...f,priorities:e.target.value}))} multiline rows={2} placeholder="עדיפות: meta titles, internal links, local SEO"/>
+              <Field label="מה לא להציע" name="av" value={seoFocus.avoidTips||""} onChange={e=>setSeoFocus(f=>({...f,avoidTips:e.target.value}))} multiline rows={2} placeholder="אל תציע שינוי עיצוב / צבעים / מבנה ניווט"/>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                <button onClick={saveSeoFocus} style={{background:BLUE,color:"#fff",border:"none",borderRadius:8,padding:"9px 16px",fontSize:12,fontWeight:700,cursor:"pointer"}}>שמור מיקוד</button>
+                <button onClick={regenerateFocusedTips} disabled={regenTipsLoading||!ai}
+                  style={{background:regenTipsLoading||!ai?"#94a3b8":AMBER,color:"#fff",border:"none",borderRadius:8,padding:"9px 16px",fontSize:12,fontWeight:700,cursor:regenTipsLoading||!ai?"not-allowed":"pointer"}}>
+                  {regenTipsLoading?<span style={{display:"flex",alignItems:"center",gap:6}}><Spin color="#fff" size={12}/>מייצר...</span>:"↻ צור טיפים ממוקדים מחדש"}
+                </button>
+              </div>
+            </div>
             {!ai?(
               <div style={{textAlign:"center",padding:40,color:"#94a3b8",fontSize:13,fontFamily:"Heebo,sans-serif"}}>אין נתוני אודיט — בצע סריקה</div>
             ):(
@@ -788,6 +938,12 @@ function ClientManager({onWriteArticle,initialOpenId}){
                       {(ai.quickWins||[]).map((t,i)=><div key={i} style={{fontSize:12,color:"#166534",padding:"3px 0",lineHeight:1.5}}>→ {t}</div>)}
                     </div>
                   </div>
+                  {(ai.focusedTips||[]).length>0&&(
+                    <div style={{marginTop:12,background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:9,padding:"12px 14px"}}>
+                      <div style={{fontSize:10,fontWeight:700,color:BLUE,letterSpacing:1.5,marginBottom:8,textTransform:"uppercase"}}>טיפים ממוקדים</div>
+                      {(ai.focusedTips||[]).map((t,i)=><div key={i} style={{fontSize:12,color:"#1e40af",padding:"3px 0",lineHeight:1.5}}>✦ {t}</div>)}
+                    </div>
+                  )}
                 </div>
                 {(ai.checks||[]).map((cat,ci)=>(
                   <div key={ci} style={{background:"#fff",borderRadius:10,border:"1px solid #e2e8f0",padding:"14px 18px",marginBottom:10}}>
@@ -886,13 +1042,39 @@ function ClientManager({onWriteArticle,initialOpenId}){
         </div>
       </div>
     )}
+
+    {/* ── ARTICLE PREVIEW MODAL ── */}
+    {previewArticle&&(
+      <div style={{position:"fixed",inset:0,background:"#0f172a90",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+        <div style={{background:"#fff",borderRadius:16,padding:"26px 28px",maxWidth:720,width:"100%",maxHeight:"85vh",overflowY:"auto",direction:"rtl",fontFamily:"Heebo,sans-serif"}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:16}}>
+            <div>
+              <div style={{fontSize:18,fontWeight:800,color:ACCENT,marginBottom:4}}>{previewArticle.draftContent?.title||previewArticle.publishedContent?.title||previewArticle.title}</div>
+              <div style={{fontSize:11,color:"#94a3b8",direction:"ltr"}}>/{previewArticle.draftContent?.slug||previewArticle.slug||""}</div>
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={()=>{onWriteArticle(client.id,previewArticle.id);setPreviewArticle(null);}}
+                style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer"}}>✏ ערוך</button>
+              <button onClick={()=>setPreviewArticle(null)} style={{background:"#f1f5f9",border:"none",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer",color:"#64748b"}}>✕</button>
+            </div>
+          </div>
+          {(previewArticle.draftContent?.metaDescription||previewArticle.publishedContent?.metaDescription)&&(
+            <div style={{background:"#f8fafc",borderRadius:8,padding:"10px 14px",marginBottom:14,fontSize:13,color:"#64748b"}}>
+              {previewArticle.draftContent?.metaDescription||previewArticle.publishedContent?.metaDescription}
+            </div>
+          )}
+          <ArticleView text={articleBody(previewArticle)}/>
+        </div>
+      </div>
+    )}
     </div>
   );
 }
 
 // ── CONTENT WRITER ────────────────────────────────────────────────────────────
-function ContentWriter({clientId,articleId,onBack}){
-  const client  = clientId ? DB.getById(clientId) : null;
+function ContentWriter({clientId,articleId,onBack,activeClientId}){
+  const resolvedClientId=clientId||activeClientId||null;
+  const client  = resolvedClientId ? DB.getById(resolvedClientId) : null;
   const article = (client?.articles||[]).find(a=>a.id===articleId)||null;
 
   const [form,setForm]=useState({
@@ -907,14 +1089,18 @@ function ContentWriter({clientId,articleId,onBack}){
   const [brief,setBrief]=useState(article?.brief||null);
   const [briefLoading,setBriefLoading]=useState(false);
   const [loading,setLoading]=useState(false);
-  const [result,setResult]=useState(null);
+  const [result,setResult]=useState(article?.draftContent||null);
   const [error,setError]=useState(null);
   const [tab,setTab]=useState("article");
   const [publishing,setPublishing]=useState(false);
-  const [published,setPublished]=useState(false);
-  const [schedDate,setSchedDate]=useState(article?.scheduledDate||"");
+  const [published,setPublished]=useState(article?.status==="published");
+  const [schedDate,setSchedDate]=useState(toDatetimeLocal(article?.scheduledDate||""));
   const [articleInstructions,setArticleInstructions]=useState(article?.notes||"");
   const [showInstructions,setShowInstructions]=useState(!!article?.notes?.trim());
+  const [revisionNotes,setRevisionNotes]=useState(article?.revisionNotes||{content:"",keywords:"",structure:""});
+  const [revising,setRevising]=useState(false);
+
+  const effectiveClientId=resolvedClientId||clientId;
 
   const generateBrief=async()=>{
     if(!form.topic||!form.keywords){setError("נא למלא נושא ומילות מפתח");return;}
@@ -922,19 +1108,20 @@ function ContentWriter({clientId,articleId,onBack}){
     try{
       const feedback=articleInstructions.trim()||article?.notes?.trim()||"";
       const prompt=
-        "Create a Hebrew SEO article brief.\n\n"+
+        "Create an SEO article brief.\n\n"+
         "Topic: "+form.topic+"\nKeywords: "+form.keywords+
         "\nIndustry: "+(form.industry||"?")+"\nLocation: "+(client?.location||"")+
         "\nArticle type: "+form.articleType+"\n"+
         notesBlock(feedback)+
         ((client?.focusedKeywords||[]).length>0?"\nFocused keywords to integrate: "+(client.focusedKeywords).join(", ")+"\n":"")+
+        styleGuideBlock(client)+
         "\n"+
         'Return ONLY valid JSON: {"briefTitle":"...","angle":"...","outline":["...","...","..."],"primaryKeyword":"...","whyThisArticle":"..."}\n'+
-        "Keep outline to 3 short items. All values in Hebrew. NEVER use double-quote inside string values.";
+        "Keep outline to 3 short items. Write in the client's language. NEVER use double-quote inside string values.";
       const txt=await callClaude(prompt,1500);
       const b=parseJSON(txt);
       setBrief(b);
-      if(articleId&&clientId){DB.updateArticle(clientId,articleId,{brief:b,status:"briefed",notes:feedback||article?.notes||""});}
+      if(articleId&&effectiveClientId){DB.updateArticle(effectiveClientId,articleId,{brief:b,status:"briefed",notes:feedback||article?.notes||""});}
     }catch(e){setError("שגיאה: "+e.message);}
     setBriefLoading(false);
   };
@@ -945,28 +1132,71 @@ function ContentWriter({clientId,articleId,onBack}){
       const tL=ARTICLE_TYPES.find(t=>t.value===form.articleType)?.label||"";
       const nL=TONES.find(t=>t.value===form.tone)?.label||"";
       const prompt=
-        "Write a full Hebrew SEO blog article.\n"+
+        "Write a full SEO blog article.\n"+
         "Client: "+(form.clientName||"?")+" | Domain: "+(form.domain||"?")+" | Industry: "+(form.industry||"?")+" | Location: "+(client?.location||"")+"\n"+
         "Topic: "+form.topic+"\nKeywords: "+form.keywords+"\n"+
         (brief?"Preferred title: "+brief.briefTitle+"\nAngle: "+brief.angle+"\nOutline: "+(brief.outline||[]).join(" | ")+"\n":"")+
         "Type: "+tL+" | Tone: "+nL+" | Length: ~"+form.wordCount+" words\n"+
         ((client?.focusedKeywords||[]).length>0?"\nFocused keywords to prioritize: "+(client.focusedKeywords).join(", ")+"\n":"")+
         notesBlock(articleInstructions.trim()||article?.notes||"")+
+        styleGuideBlock(client)+
         "\nCurrent year is 2026. Use 2026 in titles and content unless explicitly told otherwise.\n"+
         "\nOUTPUT FORMAT — follow EXACTLY (do not wrap in markdown):\n"+
         "<<<META>>>\n"+
         '{"title":"...","metaTitle":"...","metaDescription":"...","slug":"english-kebab-case","readTime":"X דקות","keywords":["k1","k2"],"lsiKeywords":["l1","l2"],"outline":[{"heading":"...","subheadings":["..."]}],"altTexts":["..."],"internalLinkSuggestions":["..."],"seoScore":85,"seoTips":["..."]}\n'+
         "<<<ARTICLE>>>\n"+
-        "Full article body in Hebrew markdown (## H2, ### H3, paragraphs). Plain text — NOT inside JSON.\n"+
+        "Full article body in markdown (## H2, ### H3, paragraphs). Plain text — NOT inside JSON.\n"+
         "<<<END>>>\n"+
         "META JSON must be short and valid. NEVER put the article body inside the META JSON. NEVER use double-quote inside META string values.";
       const txt=await callClaude(prompt,8000);
-      setResult(parseArticleResponse(txt));setTab("article");
-      if(schedDate&&articleId&&clientId){
-        DB.updateArticle(clientId,articleId,{scheduledDate:schedDate,status:"scheduled"});
+      const parsed={...parseArticleResponse(txt),generatedAt:new Date().toISOString()};
+      setResult(parsed);setTab("article");
+      if(articleId&&effectiveClientId){
+        DB.updateArticle(effectiveClientId,articleId,{
+          draftContent:parsed,
+          title:parsed.title||form.topic,
+          keywords:Array.isArray(parsed.keywords)?parsed.keywords.join(", "):form.keywords,
+          slug:parsed.slug,
+          scheduledDate:schedDate||null,
+          status:schedDate?"scheduled":"briefed",
+          notes:articleInstructions.trim()||article?.notes||"",
+        });
       }
     }catch(e){setError("שגיאה: "+e.message);}
     setLoading(false);
+  };
+
+  const regenerateArticle=async()=>{
+    if(!result)return;
+    const hasNotes=revisionNotes.content?.trim()||revisionNotes.keywords?.trim()||revisionNotes.structure?.trim();
+    if(!hasNotes){setError("נא למלא לפחות הערה אחת לשיפור");return;}
+    setRevising(true);setError(null);
+    try{
+      const prompt=
+        "Revise this SEO article according to the feedback. Keep the same brand voice.\n"+
+        styleGuideBlock(client)+
+        (revisionNotes.content?.trim()?"\nContent feedback: "+revisionNotes.content.trim()+"\n":"")+
+        (revisionNotes.keywords?.trim()?"\nKeywords feedback: "+revisionNotes.keywords.trim()+"\n":"")+
+        (revisionNotes.structure?.trim()?"\nStructure feedback: "+revisionNotes.structure.trim()+"\n":"")+
+        "\nCurrent META:\n"+JSON.stringify({title:result.title,metaTitle:result.metaTitle,metaDescription:result.metaDescription,slug:result.slug,keywords:result.keywords,lsiKeywords:result.lsiKeywords,outline:result.outline,seoScore:result.seoScore,seoTips:result.seoTips})+"\n"+
+        "\nCurrent ARTICLE:\n"+(result.article||"").slice(0,6000)+"\n"+
+        "\nOUTPUT FORMAT — follow EXACTLY:\n<<<META>>>\n"+
+        '{"title":"...","metaTitle":"...","metaDescription":"...","slug":"...","readTime":"...","keywords":[],"lsiKeywords":[],"outline":[{"heading":"...","subheadings":[]}],"altTexts":[],"internalLinkSuggestions":[],"seoScore":85,"seoTips":[]}\n'+
+        "<<<ARTICLE>>>\nRevised full article body\n<<<END>>>";
+      const txt=await callClaude(prompt,8000);
+      const parsed={...parseArticleResponse(txt),generatedAt:new Date().toISOString()};
+      setResult(parsed);setTab("article");
+      if(articleId&&effectiveClientId){
+        DB.updateArticle(effectiveClientId,articleId,{
+          draftContent:parsed,
+          title:parsed.title||form.topic,
+          keywords:Array.isArray(parsed.keywords)?parsed.keywords.join(", "):form.keywords,
+          slug:parsed.slug,
+          revisionNotes,
+        });
+      }
+    }catch(e){setError("שגיאה: "+e.message);}
+    setRevising(false);
   };
 
   const publishArticle=async()=>{
@@ -977,12 +1207,12 @@ function ContentWriter({clientId,articleId,onBack}){
       const content={title:result.title,metaTitle:result.metaTitle,metaDescription:result.metaDescription,content:result.article,keywords:result.keywords,slug:result.slug};
       await pushToWorker(client,{...content,publishedAt:now});
       setPublished(true);
-      if(articleId&&clientId){
+      if(articleId&&effectiveClientId){
         const prevVersions=article?.versions||[];
         const nextVersions=article?.publishedContent
           ? [...prevVersions,{...article.publishedContent,publishedAt:article.publishedAt,version:prevVersions.length+1}]
           : prevVersions;
-        DB.updateArticle(clientId,articleId,{status:"published",publishedAt:now,slug:result.slug,publishedContent:content,versions:nextVersions});
+        DB.updateArticle(effectiveClientId,articleId,{status:"published",publishedAt:now,slug:result.slug,publishedContent:content,draftContent:result,versions:nextVersions});
       }
     }catch(e){setError("שגיאת פרסום: "+e.message);}
     setPublishing(false);
@@ -1090,8 +1320,8 @@ function ContentWriter({clientId,articleId,onBack}){
               </div>
               <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
                 <div>
-                  <label style={{display:"block",fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4,fontFamily:"Heebo,sans-serif"}}>תאריך פרסום מתוכנן</label>
-                  <input type="date" value={schedDate} onChange={e=>setSchedDate(e.target.value)}
+                  <label style={{display:"block",fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4,fontFamily:"Heebo,sans-serif"}}>תאריך ושעת פרסום</label>
+                  <input type="datetime-local" value={schedDate} onChange={e=>setSchedDate(e.target.value)}
                     style={{padding:"7px 10px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:13,color:ACCENT,outline:"none",direction:"ltr"}}/>
                 </div>
                 <button onClick={generate} style={{flex:1,background:ACCENT,color:"#fff",border:"none",borderRadius:9,padding:"12px 0",fontSize:14,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif",minWidth:160}}>
@@ -1172,6 +1402,29 @@ function ContentWriter({clientId,articleId,onBack}){
                 ))}
               </div>
             )}
+
+            {/* Post-generation revision */}
+            <div style={{marginTop:22,background:"#fff",borderRadius:12,border:"1px solid #e2e8f0",padding:"18px 20px"}}>
+              <div style={{fontSize:13,fontWeight:800,color:ACCENT,marginBottom:12}}>↻ שפר את המאמר</div>
+              <Field label="הערות לתוכן" name="rc" value={revisionNotes.content||""} onChange={e=>setRevisionNotes(n=>({...n,content:e.target.value}))} multiline rows={2} placeholder="שנה פסקה 2, הוסף דוגמה..."/>
+              <Field label="הערות למילות מפתח" name="rk" value={revisionNotes.keywords||""} onChange={e=>setRevisionNotes(n=>({...n,keywords:e.target.value}))} multiline rows={2} placeholder="הוסף 'טרקטורונים חדרה', הסר..."/>
+              <Field label="הערות למבנה" name="rs" value={revisionNotes.structure||""} onChange={e=>setRevisionNotes(n=>({...n,structure:e.target.value}))} multiline rows={2} placeholder="הוסף H2 על תחזוקה, הסר סעיף על..."/>
+              <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap",marginTop:4}}>
+                <div>
+                  <label style={{display:"block",fontSize:11,fontWeight:600,color:"#64748b",marginBottom:4}}>תאריך ושעת פרסום</label>
+                  <input type="datetime-local" value={schedDate} onChange={e=>{
+                    setSchedDate(e.target.value);
+                    if(articleId&&effectiveClientId){
+                      DB.updateArticle(effectiveClientId,articleId,{scheduledDate:e.target.value||null,status:e.target.value?"scheduled":"briefed"});
+                    }
+                  }} style={{padding:"7px 10px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:13,color:ACCENT,outline:"none",direction:"ltr"}}/>
+                </div>
+                <button onClick={regenerateArticle} disabled={revising}
+                  style={{background:revising?"#94a3b8":AMBER,color:"#fff",border:"none",borderRadius:9,padding:"12px 18px",fontSize:13,fontWeight:700,cursor:revising?"not-allowed":"pointer"}}>
+                  {revising?<span style={{display:"flex",alignItems:"center",gap:6}}><Spin color="#fff"/>משפר...</span>:"↻ שפר מאמר לפי הערות"}
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </div>
@@ -1180,16 +1433,18 @@ function ContentWriter({clientId,articleId,onBack}){
 }
 
 // ── CALENDAR ──────────────────────────────────────────────────────────────────
-function Calendar(){
-  const clients=DB.get();
+function Calendar({activeClientId,onWriteArticle}){
+  const clients=getActiveClients(activeClientId);
+  const [preview,setPreview]=useState(null);
   const rows=[];
   clients.forEach(c=>{
     (c.articles||[]).forEach(a=>{
       if(a.scheduledDate||a.publishedAt){
         rows.push({
           date:a.publishedAt||a.scheduledDate,
-          client:c.name, domain:c.domain,
-          title:a.title, status:a.status, slug:a.slug,
+          client:c.name, domain:c.domain, clientId:c.id,
+          articleId:a.id, title:a.title, status:a.status, slug:a.slug||a.draftContent?.slug,
+          article:a,
         });
       }
     });
@@ -1200,23 +1455,24 @@ function Calendar(){
     return new Date(a.date)-new Date(b.date);
   });
 
-  const fmt=(d)=>{try{return new Date(d).toLocaleDateString("he-IL",{day:"numeric",month:"long",year:"numeric"});}catch{return d;}};
+  const fmt=(d)=>formatDateTime(d);
 
   return(
     <div style={{flex:1,overflowY:"auto",padding:"28px 32px",background:"#f8fafc"}}>
-      <div style={{maxWidth:800,margin:"0 auto"}}>
-        <div style={{fontSize:20,fontWeight:800,color:ACCENT,fontFamily:"Heebo,sans-serif",marginBottom:20}}>לוח פרסום</div>
+      <div style={{maxWidth:900,margin:"0 auto"}}>
+        <div style={{fontSize:20,fontWeight:800,color:ACCENT,fontFamily:"Heebo,sans-serif",marginBottom:8}}>לוח פרסום</div>
+        {activeClientId&&<div style={{fontSize:13,color:"#64748b",marginBottom:16}}>מציג רק: {DB.getById(activeClientId)?.name}</div>}
         {rows.length===0?(
           <div style={{textAlign:"center",padding:"60px 0",color:"#94a3b8",fontSize:13,fontFamily:"Heebo,sans-serif"}}>
             אין מאמרים מתוזמנים — אשר מאמרים וקבע תאריכי פרסום בכרטיסי הלקוחות
           </div>
         ):(
           <div style={{background:"#fff",borderRadius:12,border:"1px solid #e2e8f0",overflow:"hidden"}}>
-            <div style={{display:"grid",gridTemplateColumns:"160px 1fr 120px 100px",background:ACCENT,color:"#fff",padding:"10px 18px",gap:12,fontSize:11,fontWeight:700,letterSpacing:1,textTransform:"uppercase",fontFamily:"Heebo,sans-serif"}}>
-              <div>תאריך</div><div>מאמר</div><div>לקוח</div><div>סטטוס</div>
+            <div style={{display:"grid",gridTemplateColumns:"170px 1fr 110px 90px 100px",background:ACCENT,color:"#fff",padding:"10px 18px",gap:12,fontSize:11,fontWeight:700,letterSpacing:1,textTransform:"uppercase",fontFamily:"Heebo,sans-serif"}}>
+              <div>תאריך</div><div>מאמר</div><div>לקוח</div><div>סטטוס</div><div></div>
             </div>
             {rows.map((r,i)=>(
-              <div key={i} style={{display:"grid",gridTemplateColumns:"160px 1fr 120px 100px",padding:"12px 18px",gap:12,borderBottom:"1px solid #f1f5f9",alignItems:"center",background:i%2===0?"#fff":"#fafafa"}}>
+              <div key={i} style={{display:"grid",gridTemplateColumns:"170px 1fr 110px 90px 100px",padding:"12px 18px",gap:12,borderBottom:"1px solid #f1f5f9",alignItems:"center",background:i%2===0?"#fff":"#fafafa"}}>
                 <div style={{fontSize:12,color:"#64748b",fontFamily:"Heebo,sans-serif"}}>{fmt(r.date)}</div>
                 <div>
                   <div style={{fontSize:13,fontWeight:600,color:ACCENT,fontFamily:"Heebo,sans-serif",lineHeight:1.4}}>{r.title}</div>
@@ -1224,11 +1480,38 @@ function Calendar(){
                 </div>
                 <div style={{fontSize:12,color:"#64748b",fontFamily:"Heebo,sans-serif"}}>{r.client}</div>
                 <div><StatusBadge status={r.status}/></div>
+                <div style={{display:"flex",gap:6}}>
+                  {(articleBody(r.article)||r.article?.brief)&&(
+                    <button onClick={()=>setPreview(r)} style={{background:"#f1f5f9",border:"1px solid #e2e8f0",borderRadius:6,padding:"5px 10px",fontSize:11,fontWeight:700,cursor:"pointer",color:ACCENT}}>👁 צפה</button>
+                  )}
+                </div>
               </div>
             ))}
           </div>
         )}
       </div>
+      {preview&&(
+        <div style={{position:"fixed",inset:0,background:"#0f172a90",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div style={{background:"#fff",borderRadius:16,padding:"26px 28px",maxWidth:720,width:"100%",maxHeight:"85vh",overflowY:"auto",direction:"rtl",fontFamily:"Heebo,sans-serif"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:16}}>
+              <div>
+                <div style={{fontSize:18,fontWeight:800,color:ACCENT}}>{preview.article.draftContent?.title||preview.title}</div>
+                <div style={{fontSize:12,color:"#64748b",marginTop:4}}>{preview.client} · {fmt(preview.date)}</div>
+              </div>
+              <div style={{display:"flex",gap:8}}>
+                <button onClick={()=>{onWriteArticle?.(preview.clientId,preview.articleId);setPreview(null);}}
+                  style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer"}}>✏ ערוך</button>
+                <button onClick={()=>setPreview(null)} style={{background:"#f1f5f9",border:"none",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer",color:"#64748b"}}>✕</button>
+              </div>
+            </div>
+            {articleBody(preview.article)?(
+              <ArticleView text={articleBody(preview.article)}/>
+            ):(
+              <div style={{color:"#94a3b8",fontSize:13}}>אין טיוטת מאמר מלאה עדיין — רק תקציר/תזמון.</div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1238,17 +1521,30 @@ export default function SEOAgent(){
   const [page,setPage]=useState("scan");
   const [writeProps,setWriteProps]=useState(null);
   const [openClientId,setOpenClientId]=useState(null);
+  const [activeClientId,setActiveClientId]=useState(null);
   const [ready,setReady]=useState(!supabase); // no Supabase configured → skip hydration wait
+  const [,setTick]=useState(0);
+  const refreshNav=()=>setTick(t=>t+1);
 
   useEffect(()=>{
     if(!supabase)return;
     DB.hydrate().finally(()=>setReady(true));
   },[]);
 
-  const goWrite=(clientId,articleId)=>{setWriteProps({clientId,articleId});setPage("write");};
-  const goClients=(clientId)=>{setOpenClientId(clientId);setPage("clients");};
+  const goWrite=(clientId,articleId)=>{
+    if(clientId)setActiveClientId(clientId);
+    setWriteProps({clientId,articleId});
+    setPage("write");
+  };
+  const goClients=(clientId)=>{
+    if(clientId){setOpenClientId(clientId);setActiveClientId(clientId);}
+    setPage("clients");
+  };
 
-  const totalScheduled=DB.get().reduce((s,c)=>s+(c.articles||[]).filter(a=>a.status==="scheduled").length,0);
+  const scopedClients=getActiveClients(activeClientId);
+  const totalScheduled=scopedClients.reduce((s,c)=>s+(c.articles||[]).filter(a=>a.status==="scheduled").length,0);
+  const activeClient=activeClientId?DB.getById(activeClientId):null;
+  const allClients=DB.get();
 
   if(!ready){
     return(
@@ -1269,28 +1565,39 @@ export default function SEOAgent(){
         input,select,button,textarea{font-family:Heebo,sans-serif}
       `}</style>
       <div style={{minHeight:"100vh",background:"#f1f5f9",direction:"rtl",fontFamily:"Heebo,sans-serif",display:"flex",flexDirection:"column"}}>
-        <div style={{background:ACCENT,color:"#fff",padding:"0 24px",display:"flex",alignItems:"center",height:52,flexShrink:0}}>
-          <div style={{display:"flex",alignItems:"center",gap:10,marginLeft:20}}>
+        <div style={{background:ACCENT,color:"#fff",padding:"0 24px",display:"flex",alignItems:"center",height:52,flexShrink:0,gap:12}}>
+          <div style={{display:"flex",alignItems:"center",gap:10,marginLeft:8}}>
             <div style={{width:30,height:30,background:BLUE,borderRadius:7,display:"flex",alignItems:"center",justifyContent:"center",fontSize:14}}>✦</div>
             <div>
-              <div style={{fontWeight:800,fontSize:14}}>סוכן SEO</div>
+              <div style={{fontWeight:800,fontSize:14}}>סוכן SEO{activeClient?" · "+activeClient.name:""}</div>
               <div style={{fontSize:10,color:"#64748b"}}>כלי קידום אורגני</div>
             </div>
           </div>
+          <select value={activeClientId||""} onChange={e=>{
+            const id=e.target.value||null;
+            setActiveClientId(id);
+            if(id){setOpenClientId(id);refreshNav();}
+          }} style={{background:"#1e293b",color:"#fff",border:"1px solid #334155",borderRadius:8,padding:"6px 10px",fontSize:12,maxWidth:200,outline:"none"}}>
+            <option value="">כל הלקוחות</option>
+            {allClients.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
           <div style={{display:"flex",gap:2,flex:1}}>
             {[
               {key:"scan",    label:"🔍 סריקה"},
-              {key:"clients", label:"👥 לקוחות", badge:DB.get().length},
+              {key:"clients", label:"👥 לקוחות", badge:scopedClients.length},
               {key:"write",   label:"✦ כתיבה"},
               {key:"calendar",label:"📅 לוח פרסום", badge:totalScheduled},
-            ].map(n=><NavTab key={n.key} label={n.label} active={page===n.key} onClick={()=>setPage(n.key)} badge={n.badge}/>)}
+            ].map(n=><NavTab key={n.key} label={n.label} active={page===n.key} onClick={()=>{
+              if(n.key==="clients"&&activeClientId)setOpenClientId(activeClientId);
+              setPage(n.key);
+            }} badge={n.badge}/>)}
           </div>
         </div>
         <div style={{display:"flex",flex:1,overflow:"hidden"}}>
-          {page==="scan"    && <SiteScanner onClientSaved={id=>{setOpenClientId(id);setPage("clients");}}/>}
-          {page==="clients" && <ClientManager onWriteArticle={goWrite} initialOpenId={openClientId}/>}
-          {page==="write"   && <ContentWriter clientId={writeProps?.clientId} articleId={writeProps?.articleId} onBack={()=>setPage("clients")}/>}
-          {page==="calendar"&& <Calendar/>}
+          {page==="scan"    && <SiteScanner onClientSaved={id=>{setOpenClientId(id);setActiveClientId(id);setPage("clients");}}/>}
+          {page==="clients" && <ClientManager onWriteArticle={goWrite} initialOpenId={openClientId} onSelectClient={id=>setActiveClientId(id)}/>}
+          {page==="write"   && <ContentWriter clientId={writeProps?.clientId} articleId={writeProps?.articleId} activeClientId={activeClientId} onBack={()=>goClients(writeProps?.clientId||activeClientId)}/>}
+          {page==="calendar"&& <Calendar activeClientId={activeClientId} onWriteArticle={goWrite}/>}
         </div>
       </div>
     </>
