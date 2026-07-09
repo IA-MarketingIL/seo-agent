@@ -33,13 +33,84 @@ const callClaude = async (msg, maxTokens = 2000) => {
   return d.text || "";
 };
 
+const normalizeWorkerUrl=(url)=>(url||"").trim().replace(/\/$/,"");
+
+const getPublishTarget=(client)=>{
+  if(!client)return null;
+  const workerUrl=normalizeWorkerUrl(client.workerUrl);
+  const token=(client.token||"").trim();
+  if(!workerUrl||!token)return null;
+  return {workerUrl,token,name:client.name||"",domain:client.domain||""};
+};
+
+const confirmPublish=(client,articleTitle)=>{
+  const target=getPublishTarget(client);
+  if(!target){
+    alert("חסר חיבור לאתר אצל הלקוח הזה.\nפתחי את כרטיס הלקוח → הגדרות → הזיני Worker URL ו-Auth Token, ואז בדקי חיבור.");
+    return false;
+  }
+  return window.confirm(
+    "פרסום לאתר של הלקוח:\n\n"+
+    "לקוח: "+target.name+"\n"+
+    "דומיין: "+(target.domain||"—")+"\n"+
+    "Worker: "+target.workerUrl+"\n"+
+    (articleTitle?"מאמר: "+articleTitle+"\n":"")+
+    "\nהמאמר יישלח רק לחיבור של הלקוח הזה.\nלהמשיך?"
+  );
+};
+
+const testWorkerConnection=async({workerUrl,token})=>{
+  const base=normalizeWorkerUrl(workerUrl);
+  const auth=(token||"").trim();
+  if(!base)throw new Error("חסר Worker URL");
+  if(!auth)throw new Error("חסר Auth Token");
+  if(!/^https?:\/\//i.test(base))throw new Error("Worker URL חייב להתחיל ב-https://");
+
+  let info=null;
+  try{
+    const infoRes=await fetch(base+"/seo-api/info",{method:"GET"});
+    if(!infoRes.ok)throw new Error("HTTP "+infoRes.status);
+    info=await infoRes.json();
+  }catch(e){
+    throw new Error("לא מצליח להגיע ל-Worker (בדיקת /seo-api/info): "+e.message);
+  }
+
+  try{
+    const pingRes=await fetch(base+"/seo-api/ping",{
+      method:"GET",
+      headers:{Authorization:"Bearer "+auth},
+    });
+    if(pingRes.status===401)throw new Error("ה-Auth Token לא תואם ל-Worker של הלקוח");
+    if(pingRes.status===404)throw new Error("ה-Worker ישן מדי — חסר endpoint /seo-api/ping. עדכני את תבנית ה-Worker");
+    if(!pingRes.ok)throw new Error("בדיקת הרשאה נכשלה (HTTP "+pingRes.status+")");
+    const ping=await pingRes.json();
+    return {
+      ok:true,
+      checkedAt:new Date().toISOString(),
+      domain:info?.domain||ping?.domain||"",
+      articleCount:info?.articleCount??null,
+      workerVersion:info?.workerVersion||ping?.workerVersion||"",
+    };
+  }catch(e){
+    if(String(e.message||"").includes("Auth Token")||String(e.message||"").includes("endpoint"))throw e;
+    throw new Error("בדיקת הרשאה נכשלה: "+e.message);
+  }
+};
+
 const pushToWorker = async (client, content) => {
-  const res = await fetch(client.workerUrl.replace(/\/$/,"") + "/seo-api/articles", {
+  const target=getPublishTarget(client);
+  if(!target)throw new Error("חסר Worker URL או Auth Token אצל הלקוח");
+  const res = await fetch(target.workerUrl + "/seo-api/articles", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + client.token },
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + target.token },
     body: JSON.stringify(content),
   });
-  if (!res.ok) throw new Error("HTTP " + res.status);
+  if (res.status===401) throw new Error("Unauthorized — הטוקן לא תואם ל-Worker של הלקוח");
+  if (!res.ok) {
+    let detail="";
+    try{const d=await res.json();detail=d.error?": "+d.error:"";}catch{}
+    throw new Error("HTTP " + res.status + detail);
+  }
 };
 
 const parseJSON = (txt) => {
@@ -484,6 +555,10 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
   // update Worker settings
   const [workerUrl,setWorkerUrl]=useState(initialClient?.workerUrl||"");
   const [token,setToken]=useState(initialClient?.token||"");
+  const [connTesting,setConnTesting]=useState(false);
+  const [connMsg,setConnMsg]=useState("");
+  const [connOk,setConnOk]=useState(null);
+  const [settingsSaved,setSettingsSaved]=useState(false);
 
   useEffect(()=>{
     if(initialOpenId){
@@ -494,6 +569,7 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
       setFocusedKeywords(c?.focusedKeywords||[]);
       setStyleGuide(c?.styleGuide||{language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]});
       setSeoFocus(c?.seoFocus||{tipNotes:"",avoidTips:"",priorities:""});
+      setConnMsg("");setConnOk(null);setSettingsSaved(false);
     }
   },[initialOpenId]);
 
@@ -504,13 +580,55 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
     setFocusedKeywords(c?.focusedKeywords||[]);
     setStyleGuide(c?.styleGuide||{language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]});
     setSeoFocus(c?.seoFocus||{tipNotes:"",avoidTips:"",priorities:""});
+    setConnMsg("");setConnOk(null);setSettingsSaved(false);
     setOpenId(id); setCardTab("articles");
     onSelectClient?.(id);
   };
 
   const saveSettings=()=>{
-    DB.update(openId,{workerUrl,token});
+    const cleanUrl=normalizeWorkerUrl(workerUrl);
+    const cleanToken=(token||"").trim();
+    DB.update(openId,{workerUrl:cleanUrl,token:cleanToken,publishConnection:null});
+    setWorkerUrl(cleanUrl);
+    setToken(cleanToken);
+    setConnMsg("");setConnOk(null);
+    setSettingsSaved(true);
+    setTimeout(()=>setSettingsSaved(false),2000);
     refresh();
+  };
+
+  const testConnection=async()=>{
+    setConnTesting(true);setConnMsg("");setConnOk(null);
+    try{
+      const result=await testWorkerConnection({workerUrl,token});
+      DB.update(openId,{
+        workerUrl:normalizeWorkerUrl(workerUrl),
+        token:(token||"").trim(),
+        publishConnection:{
+          ok:true,
+          checkedAt:result.checkedAt,
+          domain:result.domain||"",
+          articleCount:result.articleCount,
+          workerVersion:result.workerVersion||"",
+        },
+      });
+      setConnOk(true);
+      setConnMsg(
+        "החיבור תקין"+
+        (result.domain?" · "+result.domain:"")+
+        (result.articleCount!=null?" · "+result.articleCount+" מאמרים ב-Worker":"")+
+        (result.workerVersion?" · v"+result.workerVersion:"")
+      );
+      refresh();
+    }catch(e){
+      DB.update(openId,{
+        publishConnection:{ok:false,checkedAt:new Date().toISOString(),error:e.message},
+      });
+      setConnOk(false);
+      setConnMsg(e.message);
+      refresh();
+    }
+    setConnTesting(false);
   };
 
   const saveFocusedKeywords=()=>{
@@ -562,7 +680,8 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
 
   const revertVersion=async(article,version)=>{
     const c=DB.getById(openId);
-    if(!c?.workerUrl){alert("הגדר Worker URL בהגדרות הלקוח");return;}
+    if(!getPublishTarget(c)){alert("הגדר Worker URL ו-Auth Token בהגדרות הלקוח");return;}
+    if(!confirmPublish(c,version.title||article.title))return;
     setReverting(true);
     try{
       const now=new Date().toISOString();
@@ -720,6 +839,13 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
                       <span style={{background:BLUE+"14",color:BLUE,borderRadius:20,padding:"2px 10px",fontSize:11,fontWeight:600}}>{total} מאמרים</span>
                       {sched>0&&<span style={{background:PURPLE+"14",color:PURPLE,borderRadius:20,padding:"2px 10px",fontSize:11,fontWeight:600}}>{sched} מתוזמן</span>}
                       {pub>0&&<span style={{background:GREEN+"14",color:GREEN,borderRadius:20,padding:"2px 10px",fontSize:11,fontWeight:600}}>{pub} פורסם</span>}
+                      {c.workerUrl&&c.token?(
+                        <span style={{background:(c.publishConnection?.ok?GREEN:AMBER)+"14",color:c.publishConnection?.ok?GREEN:AMBER,borderRadius:20,padding:"2px 10px",fontSize:11,fontWeight:600}}>
+                          {c.publishConnection?.ok?"🔗 מחובר":"⚙ חיבור מוגדר"}
+                        </span>
+                      ):(
+                        <span style={{background:"#f1f5f9",color:"#94a3b8",borderRadius:20,padding:"2px 10px",fontSize:11,fontWeight:600}}>לא מחובר לאתר</span>
+                      )}
                     </div>
                     {c.scannedAt&&<div style={{fontSize:10,color:"#cbd5e1",marginTop:8,fontFamily:"Heebo,sans-serif"}}>סרוק: {formatDate(c.scannedAt)}</div>}
                   </div>
@@ -746,6 +872,13 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
           <div style={{fontSize:17,fontWeight:800,color:ACCENT,fontFamily:"Heebo,sans-serif"}}>{client.name}</div>
           <div style={{fontSize:11,color:"#94a3b8",direction:"ltr"}}>{client.domain}{client.location?" · "+client.location:""}</div>
         </div>
+        {getPublishTarget(client)?(
+          <span style={{background:(client.publishConnection?.ok?GREEN:AMBER)+"14",color:client.publishConnection?.ok?GREEN:AMBER,borderRadius:20,padding:"4px 10px",fontSize:11,fontWeight:700}}>
+            {client.publishConnection?.ok?"🔗 מחובר לאתר":"⚙ חיבור מוגדר"}
+          </span>
+        ):(
+          <span style={{background:"#f1f5f9",color:"#94a3b8",borderRadius:20,padding:"4px 10px",fontSize:11,fontWeight:600}}>לא מחובר לאתר</span>
+        )}
         {ai&&<div style={{marginRight:"auto",display:"flex",alignItems:"center",gap:10}}>
           <ScoreBadge score={ai.overallScore}/>
         </div>}
@@ -1008,15 +1141,47 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
 
         {/* ── SETTINGS TAB ── */}
         {cardTab==="settings"&&(
-          <div style={{maxWidth:560}}>
+          <div style={{maxWidth:620}}>
             <div style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"20px 22px",marginBottom:14}}>
               <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",letterSpacing:1.5,marginBottom:14,textTransform:"uppercase"}}>חיבור לאתר (Cloudflare Worker)</div>
-              <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:9,padding:"10px 14px",marginBottom:16,fontSize:12,color:"#92400e",lineHeight:1.8}}>
-                פרוס את <strong>cloudflare-worker-template.js</strong> על דומיין הלקוח, הגדר KV + AUTH_TOKEN, והכנס כאן.
+              <div style={{background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:9,padding:"12px 14px",marginBottom:14,fontSize:12,color:"#1e40af",lineHeight:1.8}}>
+                <div style={{fontWeight:700,marginBottom:6}}>חיבור ייחודי ללקוח הזה בלבד</div>
+                המאמרים של <strong>{client.name}</strong> יפורסמו רק ל־Worker שמוגדר כאן.
+                לכל לקוח חייבים Worker נפרד + Auth Token נפרד — אחרת עלול להיות ערבוב בין אתרים.
               </div>
-              <Field label="Worker URL" name="wu" value={workerUrl} onChange={e=>setWorkerUrl(e.target.value)} placeholder="https://seo-api.client.workers.dev" ltr/>
-              <Field label="Auth Token" name="tok" value={token} onChange={e=>setToken(e.target.value)} placeholder="סיסמה סודית" ltr/>
-              <button onClick={saveSettings} style={{background:BLUE,color:"#fff",border:"none",borderRadius:8,padding:"9px 20px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>שמור</button>
+              <div style={{background:"#fffbeb",border:"1px solid #fde68a",borderRadius:9,padding:"10px 14px",marginBottom:16,fontSize:12,color:"#92400e",lineHeight:1.8}}>
+                <div style={{fontWeight:700,marginBottom:4}}>הקמה באתר הלקוח (בהמשך):</div>
+                1. פורסים את <strong>cloudflare-worker-template.js</strong> בחשבון Cloudflare של הלקוח<br/>
+                2. יוצרים KV בשם <strong>SEO_ARTICLES</strong> וקושרים ל־Worker<br/>
+                3. מגדירים <strong>AUTH_TOKEN</strong> ייחודי ללקוח הזה<br/>
+                4. מדביקים כאן את Worker URL + אותו Token, שומרים, ולוחצים "בדיקת חיבור"
+              </div>
+              <Field label="Worker URL" name="wu" value={workerUrl} onChange={e=>{setWorkerUrl(e.target.value);setConnOk(null);setConnMsg("");}} placeholder="https://seo-api-client.xxx.workers.dev" ltr/>
+              <Field label="Auth Token" name="tok" value={token} onChange={e=>{setToken(e.target.value);setConnOk(null);setConnMsg("");}} placeholder="סיסמה סודית ייחודית ללקוח" ltr/>
+              <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center",marginBottom:10}}>
+                <button onClick={saveSettings} style={{background:BLUE,color:"#fff",border:"none",borderRadius:8,padding:"9px 20px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>שמור חיבור</button>
+                <button onClick={testConnection} disabled={connTesting||!workerUrl.trim()||!token.trim()} style={{background:connTesting||!workerUrl.trim()||!token.trim()?"#94a3b8":GREEN,color:"#fff",border:"none",borderRadius:8,padding:"9px 20px",fontSize:13,fontWeight:700,cursor:connTesting||!workerUrl.trim()||!token.trim()?"not-allowed":"pointer",fontFamily:"Heebo,sans-serif"}}>
+                  {connTesting?<span style={{display:"flex",alignItems:"center",gap:6}}><Spin color="#fff" size={12}/>בודק...</span>:"🔌 בדיקת חיבור"}
+                </button>
+                {settingsSaved&&<span style={{fontSize:12,color:GREEN,fontWeight:600}}>✓ נשמר</span>}
+              </div>
+              {(connMsg||client.publishConnection)&&(
+                <div style={{
+                  background:connOk===false||(connOk===null&&client.publishConnection?.ok===false)?"#fef2f2":"#f0fdf4",
+                  border:"1px solid "+(connOk===false||(connOk===null&&client.publishConnection?.ok===false)?"#fecaca":"#bbf7d0"),
+                  borderRadius:8,padding:"10px 12px",fontSize:12,lineHeight:1.7,
+                  color:connOk===false||(connOk===null&&client.publishConnection?.ok===false)?RED:GREEN,
+                }}>
+                  {connMsg
+                    ?(connOk===false?"✗ ":"✓ ")+connMsg
+                    :(client.publishConnection?.ok
+                      ?"✓ חיבור אחרון תקין"+ (client.publishConnection.domain?" · "+client.publishConnection.domain:"")+(client.publishConnection.checkedAt?" · "+formatDateTime(client.publishConnection.checkedAt):"")
+                      :"✗ בדיקה אחרונה נכשלה"+(client.publishConnection?.error?": "+client.publishConnection.error:""))}
+                </div>
+              )}
+              <div style={{marginTop:14,fontSize:11,color:"#94a3b8",lineHeight:1.7}}>
+                לפני כל פרסום הסוכן יציג אישור עם שם הלקוח, הדומיין וכתובת ה־Worker — כדי למנוע פרסום בטעות לאתר אחר.
+              </div>
             </div>
             <div style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"16px 20px"}}>
               <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",letterSpacing:1.5,marginBottom:10,textTransform:"uppercase"}}>פרטי עסק</div>
@@ -1308,8 +1473,10 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
   };
 
   const publishArticle=async()=>{
-    if(!client?.workerUrl){setError("הגדר Worker URL בהגדרות הלקוח");return;}
+    if(!client){setError("בחר לקוח לפני פרסום");return;}
+    if(!getPublishTarget(client)){setError("הגדר Worker URL ו-Auth Token בהגדרות הלקוח, ואז בדקי חיבור");return;}
     if(!result)return;
+    if(!confirmPublish(client,result.title||form.topic))return;
     setPublishing(true);setError(null);
     try{
       const id=persistArticle(result,{status:schedDate?"scheduled":"draft",scheduledDate:schedDate||null});
@@ -1323,7 +1490,8 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
         ? [...prevVersions,{...prev.publishedContent,publishedAt:prev.publishedAt,version:prevVersions.length+1}]
         : prevVersions;
       DB.updateArticle(effectiveClientId,id,{status:"published",publishedAt:now,slug:result.slug,publishedContent:content,draftContent:result,versions:nextVersions});
-      setSaveMsg("פורסם לאתר הלקוח");
+      setSaveMsg("פורסם לאתר של "+(client.name||"הלקוח"));
+      if(typeof onSaved==="function")onSaved(id);
     }catch(e){setError("שגיאת פרסום: "+e.message);}
     setPublishing(false);
   };
@@ -1471,10 +1639,13 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
                 <button onClick={saveDraft} style={{background:ACCENT,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer"}}>💾 שמור מאמר</button>
                 <button onClick={saveAndSchedule} style={{background:PURPLE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer"}}>📅 שמור ותזמן</button>
                 <button onClick={exportReport} style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>⬇ ייצוא</button>
-                {client?.workerUrl&&!published&&(
+                {getPublishTarget(client)&&!published&&(
                   <button onClick={publishArticle} disabled={publishing} style={{background:publishing?"#94a3b8":GREEN,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:publishing?"not-allowed":"pointer",fontFamily:"Heebo,sans-serif"}}>
-                    {publishing?<span style={{display:"flex",alignItems:"center",gap:6}}><Spin color="#fff" size={12}/>מפרסם...</span>:"🌐 פרסם"}
+                    {publishing?<span style={{display:"flex",alignItems:"center",gap:6}}><Spin color="#fff" size={12}/>מפרסם...</span>:"🌐 פרסם לאתר"}
                   </button>
+                )}
+                {!getPublishTarget(client)&&!published&&(
+                  <span style={{background:"#fffbeb",border:"1px solid #fde68a",color:"#92400e",borderRadius:7,padding:"7px 12px",fontSize:11,fontWeight:600}}>חסר חיבור לאתר בהגדרות הלקוח</span>
                 )}
                 {published&&<span style={{background:"#f0fdf4",border:"1px solid #bbf7d0",color:GREEN,borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700}}>✓ פורסם!</span>}
               </div>

@@ -14,6 +14,7 @@
  *   POST /seo-api/articles         — publish article (requires Authorization header)
  *   DELETE /seo-api/articles/:slug — delete article (requires Authorization header)
  *   GET  /seo-api/info             — site metadata for SEO agent scanning (public)
+ *   GET  /seo-api/ping             — auth check for SEO agent connection test
  */
 
 const CORS = {
@@ -48,10 +49,20 @@ export default {
     if (request.method === "GET" && path === "/seo-api/info") {
       const articles = await listArticles(env);
       return json({
-        workerVersion: "1.0",
+        workerVersion: "1.1",
         domain: url.hostname,
         articleCount: articles.length,
         latestArticles: articles.slice(0, 5).map(a => ({ slug: a.slug, title: a.title, publishedAt: a.publishedAt })),
+      });
+    }
+
+    // ── GET /seo-api/ping ──────────────────────────────────────────
+    if (request.method === "GET" && path === "/seo-api/ping") {
+      if (!isAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
+      return json({
+        ok: true,
+        workerVersion: "1.1",
+        domain: url.hostname,
       });
     }
 
