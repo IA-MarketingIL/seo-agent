@@ -35,12 +35,17 @@ const callClaude = async (msg, maxTokens = 2000) => {
 
 const normalizeWorkerUrl=(url)=>(url||"").trim().replace(/\/$/,"");
 
+// DS Motors' site publishes directly into its own Supabase blog_articles table
+// (via functions/api/publish-dsmotors.js) — it has no Cloudflare Worker at all.
+const isDsMotors=(client)=>(client?.domain||"").includes("dsmotors.co.il");
+
 const getPublishTarget=(client)=>{
   if(!client)return null;
+  if(isDsMotors(client))return{method:"dsmotors-supabase",name:client.name||"",domain:client.domain||""};
   const workerUrl=normalizeWorkerUrl(client.workerUrl);
   const token=(client.token||"").trim();
   if(!workerUrl||!token)return null;
-  return {workerUrl,token,name:client.name||"",domain:client.domain||""};
+  return {method:"worker",workerUrl,token,name:client.name||"",domain:client.domain||""};
 };
 
 const confirmPublish=(client,articleTitle)=>{
@@ -53,7 +58,7 @@ const confirmPublish=(client,articleTitle)=>{
     "פרסום לאתר של הלקוח:\n\n"+
     "לקוח: "+target.name+"\n"+
     "דומיין: "+(target.domain||"—")+"\n"+
-    "Worker: "+target.workerUrl+"\n"+
+    (target.method==="worker"?"Worker: "+target.workerUrl+"\n":"יעד: Supabase של האתר\n")+
     (articleTitle?"מאמר: "+articleTitle+"\n":"")+
     "\nהמאמר יישלח רק לחיבור של הלקוח הזה.\nלהמשיך?"
   );
@@ -100,6 +105,22 @@ const testWorkerConnection=async({workerUrl,token})=>{
 const pushToWorker = async (client, content) => {
   const target=getPublishTarget(client);
   if(!target)throw new Error("חסר Worker URL או Auth Token אצל הלקוח");
+
+  if(target.method==="dsmotors-supabase"){
+    const res=await fetch("/api/publish-dsmotors",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({
+        title:content.title, metaDescription:content.metaDescription,
+        article:content.content, keywords:content.keywords,
+        slug:content.slug, readTime:content.readTime,
+      }),
+    });
+    const d=await res.json().catch(()=>({}));
+    if(!res.ok)throw new Error(d.error||("HTTP "+res.status));
+    return;
+  }
+
   const res = await fetch(target.workerUrl + "/seo-api/articles", {
     method: "POST",
     headers: { "Content-Type": "application/json", "Authorization": "Bearer " + target.token },
@@ -235,6 +256,19 @@ const seoFocusBlock=(client)=>{
   out+="Hard rule: Do not suggest redesigning the site, changing brand voice, colors, or navigation structure. Prefer content/meta/technical fixes that preserve the existing look and feel.\n";
   return out;
 };
+const clientContextBlock=(client)=>{
+  if(!client)return"";
+  const {businessDescription,targetAudience,differentiators,competitors,existingTopics}=client;
+  if(!businessDescription&&!targetAudience&&!differentiators&&!(competitors||[]).length&&!(existingTopics||[]).length)return"";
+  let out="\n=== CLIENT-SPECIFIC CONTEXT (ground the article in THIS business, not generic industry facts) ===\n";
+  if(businessDescription)out+="Business: "+businessDescription+"\n";
+  if(targetAudience)out+="Target audience: "+targetAudience+"\n";
+  if(differentiators?.trim())out+="What makes this business different: "+differentiators.trim()+"\n";
+  if((competitors||[]).length)out+="This business is NOT interchangeable with generic competitors like: "+competitors.join(", ")+"\n";
+  if((existingTopics||[]).length)out+="Topics already covered on the site (avoid repeating): "+existingTopics.join(", ")+"\n";
+  out+="Hard rule: Every article must sound like it could ONLY be written for this specific business — reference their actual offering, audience, and differentiators above. Avoid generic industry filler that could apply equally to any competitor.\n";
+  return out;
+};
 const articleBody=(a)=>a?.draftContent?.article||a?.publishedContent?.content||"";
 
 // ── DATA LAYER ────────────────────────────────────────────────────────────────
@@ -267,7 +301,17 @@ const DB = {
     const prev = idx >= 0 ? list[idx] : {};
     const existingArticles = prev.articles || [];
     const newOnes = (data.articles||[]).filter(na => !existingArticles.some(ea=>ea.title===na.title));
-    const merged  = { ...prev, ...data, articles: [...newOnes, ...existingArticles] };
+    // Rescanning an existing client must never wipe manually-configured connection/style fields.
+    const merged  = {
+      ...prev, ...data,
+      workerUrl: data.workerUrl || prev.workerUrl || "",
+      token: data.token || prev.token || "",
+      publishConnection: prev.publishConnection ?? null,
+      focusedKeywords: prev.focusedKeywords ?? data.focusedKeywords ?? [],
+      seoFocus: prev.seoFocus ?? data.seoFocus,
+      styleGuide: prev.styleGuide ?? data.styleGuide,
+      articles: [...newOnes, ...existingArticles],
+    };
     if (idx >= 0) list[idx] = merged; else list.unshift(merged);
     this.save(list); return merged;
   },
@@ -291,6 +335,121 @@ const DB = {
 const hasFullArticle=(a)=>!!(a?.draftContent?.article||a?.publishedContent?.content);
 const uid = () => Math.random().toString(36).slice(2,10);
 const getActiveClients=(activeClientId)=>activeClientId?DB.get().filter(c=>c.id===activeClientId):DB.get();
+
+// ── FULL SITE SCAN PIPELINE (shared by SiteScanner + client-card rescan) ──────
+async function runFullScan({url,seedName,seedIndustry,seedDesc,onStep}){
+  const u=url.trim().startsWith("http")?url.trim():"https://"+url.trim();
+  const step=(i,st)=>onStep?.(i,st);
+
+  let pageContent="";
+  try{
+    const r=await fetch("https://r.jina.ai/"+u,{signal:AbortSignal.timeout(9000),headers:{"Accept":"text/plain"}});
+    if(r.ok)pageContent=(await r.text()).slice(0,4500);
+  }catch{}
+  step(0,"done");step(1,"loading");
+
+  const extractPrompt=
+    "You are an Israeli SEO expert. Analyze this website and return ONLY valid JSON.\n"+
+    "URL: "+u+"\nBusiness name: "+(seedName||"not provided")+"\nIndustry: "+(seedIndustry||"INFER")+"\nDescription: "+(seedDesc||"not provided")+"\n"+
+    (pageContent?"\nPage content:\n"+pageContent+"\n":"")+
+    "\nReturn JSON with Hebrew values:\n"+
+    '{"businessName":"...","industry":"...","location":"city or region in Hebrew, empty if unknown","mainKeywords":["k1","k2","k3","k4","k5"],"existingTopics":["t1","t2","t3"],"businessDescription":"...","targetAudience":"...","competitors":["c1","c2"]}\n'+
+    "Extract the geographic location from the content (city, region like 'צפון', 'מרכז', etc.). NEVER use double-quote inside string values.";
+
+  const extractTxt=await callClaude(extractPrompt,900);
+  const extracted=parseJSON(extractTxt);
+  if(seedName)extracted.businessName=seedName;
+  if(seedIndustry)extracted.industry=seedIndustry;
+  if(seedDesc)extracted.businessDescription=seedDesc;
+  step(1,"done");step(2,"loading");
+
+  const stylePrompt=
+    "Analyze this website's writing voice and propose a style guide for future SEO articles.\n"+
+    "URL: "+u+"\nBusiness: "+(extracted.businessName||"")+"\nIndustry: "+(extracted.industry||"")+"\n"+
+    (pageContent?"\nPage content sample:\n"+pageContent.slice(0,3500)+"\n":"")+
+    "\nReturn ONLY valid JSON:\n"+
+    '{"language":"he","toneNotes":"...","audienceNotes":"...","writingRules":"...","doNot":"...","sampleArticles":[{"title":"...","excerpt":"150-250 words sample in same voice","url":""}]}\n'+
+    "language must be he, en, or he-en. All notes in Hebrew. Infer tone from the real site. NEVER use double-quote inside string values.";
+  let styleGuide={language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]};
+  try{
+    const styleTxt=await callClaude(stylePrompt,1500);
+    const sg=parseJSON(styleTxt);
+    styleGuide={
+      language:["he","en","he-en"].includes(sg.language)?sg.language:"he",
+      toneNotes:sg.toneNotes||"",
+      audienceNotes:sg.audienceNotes||extracted.targetAudience||"",
+      writingRules:sg.writingRules||"",
+      doNot:sg.doNot||"",
+      sampleArticles:Array.isArray(sg.sampleArticles)?sg.sampleArticles.slice(0,3).map(s=>({title:s.title||"",excerpt:s.excerpt||"",url:s.url||""})):[],
+    };
+  }catch{}
+  step(2,"done");step(3,"loading");
+
+  const suggestPrompt=
+    "You are an Israeli SEO expert. Suggest 8 blog articles.\n"+
+    "Industry: "+extracted.industry+"\nBusiness: "+extracted.businessName+"\nLocation: "+(extracted.location||"ישראל")+
+    "\nDescription: "+(seedDesc||extracted.businessDescription)+"\nTarget audience: "+extracted.targetAudience+
+    "\nKeywords: "+(extracted.mainKeywords||[]).join(", ")+"\n"+
+    styleGuideBlock({styleGuide})+"\n"+
+    "All 8 articles must be strictly about '"+extracted.industry+"'. Mix types.\n"+
+    "Include at least 2 local articles targeting: "+(extracted.location||"האזור")+"\n\n"+
+    "Return ONLY valid JSON:\n"+
+    '{"suggestions":[{"title":"Hebrew title","keywords":"Hebrew keywords","type":"informational","reason":"Hebrew SEO reason","priority":"high"}]}\n'+
+    "Types: informational, commercial, local, howto. All values in Hebrew. NEVER use double-quote inside string values.";
+
+  const suggestTxt=await callClaude(suggestPrompt,2000);
+  const suggested=parseJSON(suggestTxt);
+  step(3,"done");step(4,"loading");
+
+  const loc=extracted.location||"ישראל";
+  const kwPrompt=
+    "You are an Israeli local SEO expert. Research keywords for this business.\n"+
+    "Industry: "+extracted.industry+"\nLocation: "+loc+"\nTarget audience: "+extracted.targetAudience+"\n\n"+
+    "Return 12 Hebrew SEO keywords mixing general + local variants.\n"+
+    'Return ONLY valid JSON: {"keywords":[{"keyword":"מילת חיפוש","intent":"local|informational|commercial","competition":"low|medium|high","priority":8,"recommended":true,"localVariants":["kw + עיר","kw + אזור"]}]}\n'+
+    "priority is 1-10 (10=highest estimated monthly search volume). Mark top 4 keywords as recommended:true. Sort by priority descending. NEVER use double-quote inside string values.";
+
+  const auditPrompt=
+    "You are a technical SEO expert. Perform a quick SEO audit.\n"+
+    "URL: "+u+"\nBusiness: "+extracted.businessName+"\nIndustry: "+extracted.industry+"\n"+
+    (pageContent?"\nPage content:\n"+pageContent.slice(0,1500)+"\n":"")+
+    "\nReturn ONLY valid JSON with this EXACT structure:\n"+
+    '{"overallScore":72,"grade":"B","summary":"קצר עד 20 מילה","checks":[{"category":"מטא-דאטה","items":[{"label":"Meta Title","status":"good","value":"val","detail":"הסבר"}]},{"category":"תוכן","items":[{"label":"איכות תוכן","status":"warning","value":"val","detail":"הסבר"}]},{"category":"טכני","items":[{"label":"מהירות","status":"good","value":"val","detail":"הסבר"}]}],"topIssues":["בעיה1","בעיה2","בעיה3"],"quickWins":["פעולה1","פעולה2","פעולה3"]}\n'+
+    "Exactly 3 categories, exactly 3 items each. Keep Hebrew strings SHORT (under 15 words). NEVER use double-quote inside string values.";
+
+  const [kwTxt,auditTxt]=await Promise.all([
+    callClaude(kwPrompt,1200),
+    callClaude(auditPrompt,3000),
+  ]);
+  const kwData=parseJSON(kwTxt);
+  const auditData=parseJSON(auditTxt);
+  step(4,"done");
+
+  let domain=u; try{domain=new URL(u).hostname;}catch{}
+  const articles=(suggested.suggestions||[]).map(s=>({
+    id:uid(), title:s.title, keywords:s.keywords, type:s.type||"informational",
+    reason:s.reason, priority:s.priority, status:"suggested", source:"suggested",
+    brief:null, notes:"", draftContent:null, scheduledDate:null, publishedAt:null, slug:"",
+  }));
+
+  return {
+    domain, url:u, name:extracted.businessName||domain,
+    industry:extracted.industry, location:extracted.location||"",
+    mainKeywords:extracted.mainKeywords||[], targetAudience:extracted.targetAudience||"",
+    businessDescription:extracted.businessDescription||"",
+    competitors:extracted.competitors||[],
+    existingTopics:extracted.existingTopics||[],
+    keywordResearch:kwData.keywords||[],
+    audit:auditData, articles, styleGuide,
+  };
+}
+const SCAN_STEPS=[
+  {icon:"🌐",text:"סורק תוכן האתר"},
+  {icon:"🔍",text:"מנתח פרטי העסק"},
+  {icon:"✍",text:"לומד סגנון כתיבה"},
+  {icon:"💡",text:"מציע מאמרים"},
+  {icon:"🔑",text:"מחקר מילות מפתח + אודיט"},
+];
 
 // ── UI PRIMITIVES ─────────────────────────────────────────────────────────────
 function Spin({size=16,color=BLUE}){
@@ -384,120 +543,15 @@ function SiteScanner({onClientSaved}){
 
   const scan=async()=>{
     if(!url.trim()){setError("נא להזין URL");return;}
-    const u=url.trim().startsWith("http")?url.trim():"https://"+url.trim();
     setScan(true);setError(null);
-    setSteps([
-      {icon:"🌐",text:"סורק תוכן האתר",status:"loading"},
-      {icon:"🔍",text:"מנתח פרטי העסק",status:"idle"},
-      {icon:"✍",text:"לומד סגנון כתיבה",status:"idle"},
-      {icon:"💡",text:"מציע מאמרים",status:"idle"},
-      {icon:"🔑",text:"מחקר מילות מפתח + אודיט",status:"idle"},
-    ]);
+    setSteps(SCAN_STEPS.map((s,i)=>({...s,status:i===0?"loading":"idle"})));
     try{
-      let pageContent="";
-      try{
-        const r=await fetch("https://r.jina.ai/"+u,{signal:AbortSignal.timeout(9000),headers:{"Accept":"text/plain"}});
-        if(r.ok)pageContent=(await r.text()).slice(0,4500);
-      }catch{}
-      upd(0,"done");upd(1,"loading");
-
-      const extractPrompt=
-        "You are an Israeli SEO expert. Analyze this website and return ONLY valid JSON.\n"+
-        "URL: "+u+"\nBusiness name: "+(bizName||"not provided")+"\nIndustry: "+(industry||"INFER")+"\nDescription: "+(desc||"not provided")+"\n"+
-        (pageContent?"\nPage content:\n"+pageContent+"\n":"")+
-        "\nReturn JSON with Hebrew values:\n"+
-        '{"businessName":"...","industry":"...","location":"city or region in Hebrew, empty if unknown","mainKeywords":["k1","k2","k3","k4","k5"],"existingTopics":["t1","t2","t3"],"businessDescription":"...","targetAudience":"...","competitors":["c1","c2"]}\n'+
-        "Extract the geographic location from the content (city, region like 'צפון', 'מרכז', etc.). NEVER use double-quote inside string values.";
-
-      const extractTxt=await callClaude(extractPrompt,900);
-      const extracted=parseJSON(extractTxt);
-      if(bizName)extracted.businessName=bizName;
-      if(industry)extracted.industry=industry;
-      if(desc)extracted.businessDescription=desc;
-      upd(1,"done");upd(2,"loading");
-
-      const stylePrompt=
-        "Analyze this website's writing voice and propose a style guide for future SEO articles.\n"+
-        "URL: "+u+"\nBusiness: "+(extracted.businessName||"")+"\nIndustry: "+(extracted.industry||"")+"\n"+
-        (pageContent?"\nPage content sample:\n"+pageContent.slice(0,3500)+"\n":"")+
-        "\nReturn ONLY valid JSON:\n"+
-        '{"language":"he","toneNotes":"...","audienceNotes":"...","writingRules":"...","doNot":"...","sampleArticles":[{"title":"...","excerpt":"150-250 words sample in same voice","url":""}]}\n'+
-        "language must be he, en, or he-en. All notes in Hebrew. Infer tone from the real site. NEVER use double-quote inside string values.";
-      let styleGuide={language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]};
-      try{
-        const styleTxt=await callClaude(stylePrompt,1500);
-        const sg=parseJSON(styleTxt);
-        styleGuide={
-          language:["he","en","he-en"].includes(sg.language)?sg.language:"he",
-          toneNotes:sg.toneNotes||"",
-          audienceNotes:sg.audienceNotes||extracted.targetAudience||"",
-          writingRules:sg.writingRules||"",
-          doNot:sg.doNot||"",
-          sampleArticles:Array.isArray(sg.sampleArticles)?sg.sampleArticles.slice(0,3).map(s=>({title:s.title||"",excerpt:s.excerpt||"",url:s.url||""})):[],
-        };
-      }catch{}
-      upd(2,"done");upd(3,"loading");
-
-      const suggestPrompt=
-        "You are an Israeli SEO expert. Suggest 8 blog articles.\n"+
-        "Industry: "+extracted.industry+"\nBusiness: "+extracted.businessName+"\nLocation: "+(extracted.location||"ישראל")+
-        "\nDescription: "+(desc||extracted.businessDescription)+"\nTarget audience: "+extracted.targetAudience+
-        "\nKeywords: "+(extracted.mainKeywords||[]).join(", ")+"\n"+
-        styleGuideBlock({styleGuide})+"\n"+
-        "All 8 articles must be strictly about '"+extracted.industry+"'. Mix types.\n"+
-        "Include at least 2 local articles targeting: "+(extracted.location||"האזור")+"\n\n"+
-        "Return ONLY valid JSON:\n"+
-        '{"suggestions":[{"title":"Hebrew title","keywords":"Hebrew keywords","type":"informational","reason":"Hebrew SEO reason","priority":"high"}]}\n'+
-        "Types: informational, commercial, local, howto. All values in Hebrew. NEVER use double-quote inside string values.";
-
-      const suggestTxt=await callClaude(suggestPrompt,2000);
-      const suggested=parseJSON(suggestTxt);
-      upd(3,"done");upd(4,"loading");
-
-      const loc=extracted.location||"ישראל";
-      const kwPrompt=
-        "You are an Israeli local SEO expert. Research keywords for this business.\n"+
-        "Industry: "+extracted.industry+"\nLocation: "+loc+"\nTarget audience: "+extracted.targetAudience+"\n\n"+
-        "Return 12 Hebrew SEO keywords mixing general + local variants.\n"+
-        'Return ONLY valid JSON: {"keywords":[{"keyword":"מילת חיפוש","intent":"local|informational|commercial","competition":"low|medium|high","priority":8,"recommended":true,"localVariants":["kw + עיר","kw + אזור"]}]}\n'+
-        "priority is 1-10 (10=highest estimated monthly search volume). Mark top 4 keywords as recommended:true. Sort by priority descending. NEVER use double-quote inside string values.";
-
-      const auditPrompt=
-        "You are a technical SEO expert. Perform a quick SEO audit.\n"+
-        "URL: "+u+"\nBusiness: "+extracted.businessName+"\nIndustry: "+extracted.industry+"\n"+
-        (pageContent?"\nPage content:\n"+pageContent.slice(0,1500)+"\n":"")+
-        "\nReturn ONLY valid JSON with this EXACT structure:\n"+
-        '{"overallScore":72,"grade":"B","summary":"קצר עד 20 מילה","checks":[{"category":"מטא-דאטה","items":[{"label":"Meta Title","status":"good","value":"val","detail":"הסבר"}]},{"category":"תוכן","items":[{"label":"איכות תוכן","status":"warning","value":"val","detail":"הסבר"}]},{"category":"טכני","items":[{"label":"מהירות","status":"good","value":"val","detail":"הסבר"}]}],"topIssues":["בעיה1","בעיה2","בעיה3"],"quickWins":["פעולה1","פעולה2","פעולה3"]}\n'+
-        "Exactly 3 categories, exactly 3 items each. Keep Hebrew strings SHORT (under 15 words). NEVER use double-quote inside string values.";
-
-      const [kwTxt,auditTxt]=await Promise.all([
-        callClaude(kwPrompt,1200),
-        callClaude(auditPrompt,3000),
-      ]);
-      const kwData=parseJSON(kwTxt);
-      const auditData=parseJSON(auditTxt);
-      upd(4,"done");
-
-      let domain=u; try{domain=new URL(u).hostname;}catch{}
-      const articles=(suggested.suggestions||[]).map(s=>({
-        id:uid(), title:s.title, keywords:s.keywords, type:s.type||"informational",
-        reason:s.reason, priority:s.priority, status:"suggested", source:"suggested",
-        brief:null, notes:"", draftContent:null, scheduledDate:null, publishedAt:null, slug:"",
-      }));
-
+      const result=await runFullScan({url,seedName:bizName,seedIndustry:industry,seedDesc:desc,onStep:upd});
       const client=DB.upsert({
-        id:uid(), name:extracted.businessName||domain, domain, url:u,
-        workerUrl:"", token:"",
-        industry:extracted.industry, location:extracted.location||"",
-        mainKeywords:extracted.mainKeywords||[], targetAudience:extracted.targetAudience||"",
-        businessDescription:extracted.businessDescription||"",
-        competitors:extracted.competitors||[],
+        id:uid(), workerUrl:"", token:"",
         scannedAt:new Date().toISOString(),
-        keywordResearch:kwData.keywords||[],
-        audit:auditData, articles,
-        styleGuide,
+        ...result,
       });
-
       onClientSaved(client.id);
     }catch(e){
       setSteps(s=>s.map(x=>x.status==="loading"?{...x,status:"error"}:x));
@@ -548,6 +602,9 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
   const [reverting,setReverting]=useState(false);
   const [styleGuide,setStyleGuide]=useState(initialClient?.styleGuide||{language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]});
   const [seoFocus,setSeoFocus]=useState(initialClient?.seoFocus||{tipNotes:"",avoidTips:"",priorities:""});
+  const [differentiators,setDifferentiators]=useState(initialClient?.differentiators||"");
+  const [diffSaved,setDiffSaved]=useState(false);
+  const [rescanState,setRescanState]=useState(null);
   const refresh=()=>setClients(DB.get());
 
   const client=openId?DB.getById(openId):null;
@@ -569,6 +626,7 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
       setFocusedKeywords(c?.focusedKeywords||[]);
       setStyleGuide(c?.styleGuide||{language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]});
       setSeoFocus(c?.seoFocus||{tipNotes:"",avoidTips:"",priorities:""});
+      setDifferentiators(c?.differentiators||"");
       setConnMsg("");setConnOk(null);setSettingsSaved(false);
     }
   },[initialOpenId]);
@@ -580,9 +638,17 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
     setFocusedKeywords(c?.focusedKeywords||[]);
     setStyleGuide(c?.styleGuide||{language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]});
     setSeoFocus(c?.seoFocus||{tipNotes:"",avoidTips:"",priorities:""});
+    setDifferentiators(c?.differentiators||"");
     setConnMsg("");setConnOk(null);setSettingsSaved(false);
     setOpenId(id); setCardTab("articles");
     onSelectClient?.(id);
+  };
+
+  const saveDifferentiators=()=>{
+    DB.update(openId,{differentiators});
+    setDiffSaved(true);
+    setTimeout(()=>setDiffSaved(false),2000);
+    refresh();
   };
 
   const saveSettings=()=>{
@@ -678,6 +744,33 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
     refresh();
   };
 
+  const rescanClient=async(refreshStyle)=>{
+    const c=DB.getById(openId);
+    if(!c)return;
+    if(!window.confirm("יעדכן פרטי עסק, מילות מפתח ואודיט"+(refreshStyle?" וסגנון כתיבה":"")+". הגדרות פרסום"+(refreshStyle?"":" וסגנון כתיבה")+" לא ייפגעו. להמשיך?"))return;
+    setRescanState({steps:SCAN_STEPS.map((s,i)=>({...s,status:i===0?"loading":"idle"})),error:null});
+    const stepUpd=(i,st)=>setRescanState(s=>s?{...s,steps:s.steps.map((x,idx)=>idx===i?{...x,status:st}:x)}:s);
+    try{
+      const result=await runFullScan({url:c.url,seedName:c.name,seedIndustry:c.industry,seedDesc:c.businessDescription,onStep:stepUpd});
+      const existingArticles=c.articles||[];
+      const newOnes=result.articles.filter(na=>!existingArticles.some(ea=>ea.title===na.title));
+      const upd={
+        industry:result.industry, location:result.location,
+        mainKeywords:result.mainKeywords, targetAudience:result.targetAudience,
+        businessDescription:result.businessDescription, competitors:result.competitors,
+        existingTopics:result.existingTopics, keywordResearch:result.keywordResearch,
+        audit:result.audit, scannedAt:new Date().toISOString(),
+        articles:[...newOnes,...existingArticles],
+      };
+      if(refreshStyle)upd.styleGuide=result.styleGuide;
+      DB.update(openId,upd);
+      setRescanState(null);
+      refresh();
+    }catch(e){
+      setRescanState(s=>s?{...s,error:e.message}:s);
+    }
+  };
+
   const revertVersion=async(article,version)=>{
     const c=DB.getById(openId);
     if(!getPublishTarget(c)){alert("הגדר Worker URL ו-Auth Token בהגדרות הלקוח");return;}
@@ -709,7 +802,7 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
         "Custom direction: "+customDir+"\n"+
         "Industry: "+c.industry+"\nLocation: "+(c.location||"ישראל")+"\nBusiness: "+c.name+"\nKeywords: "+(c.mainKeywords||[]).join(", ")+"\n"+
         ((c.focusedKeywords||[]).length>0?"Focused keywords to integrate: "+c.focusedKeywords.join(", ")+"\n":"")+
-        styleGuideBlock(c)+"\n"+
+        styleGuideBlock(c)+clientContextBlock(c)+"\n"+
         'Return ONLY valid JSON: {"title":"...","keywords":"...","type":"informational","brief":{"briefTitle":"...","angle":"...","outline":["...","...","..."],"primaryKeyword":"...","whyThisArticle":"..."}}\n'+
         "Keep outline to 3 short items. Write values in the client's language. NEVER use double-quote inside string values.";
       const txt=await callClaude(prompt,1500);
@@ -793,7 +886,7 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
         "\nArticle type: "+(article.type||"informational")+
         notesBlock(article.notes)+
         ((c.focusedKeywords||[]).length>0?"\nFocused keywords: "+c.focusedKeywords.join(", ")+"\n":"")+
-        styleGuideBlock(c)+
+        styleGuideBlock(c)+clientContextBlock(c)+
         "\nReturn ONLY valid JSON: {\"briefTitle\":\"...\",\"angle\":\"...\",\"outline\":[\"...\",\"...\",\"...\"],\"primaryKeyword\":\"...\",\"whyThisArticle\":\"...\"}\n"+
         "Keep outline to 3 short items. Write in the client's language. NEVER use double-quote inside string values.";
       const txt=await callClaude(prompt,1500);
@@ -879,9 +972,17 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
         ):(
           <span style={{background:"#f1f5f9",color:"#94a3b8",borderRadius:20,padding:"4px 10px",fontSize:11,fontWeight:600}}>לא מחובר לאתר</span>
         )}
-        {ai&&<div style={{marginRight:"auto",display:"flex",alignItems:"center",gap:10}}>
-          <ScoreBadge score={ai.overallScore}/>
-        </div>}
+        <div style={{marginRight:"auto",display:"flex",alignItems:"center",gap:6}}>
+          <button onClick={()=>rescanClient(false)} disabled={!!rescanState}
+            style={{background:"#f1f5f9",color:ACCENT,border:"1px solid #e2e8f0",borderRadius:7,padding:"6px 13px",fontSize:12,fontWeight:700,cursor:rescanState?"not-allowed":"pointer",fontFamily:"Heebo,sans-serif",display:"flex",alignItems:"center",gap:6}}>
+            {rescanState?<><Spin size={12}/>סורק מחדש...</>:"🔄 סרוק מחדש"}
+          </button>
+          {!rescanState&&(
+            <button onClick={()=>rescanClient(true)} title="סרוק מחדש כולל סגנון כתיבה (מחליף את הסגנון שערכת ידנית)"
+              style={{background:"transparent",color:"#94a3b8",border:"none",fontSize:16,cursor:"pointer",padding:"4px 6px"}}>🎨</button>
+          )}
+          <div style={{marginRight:4}}>{ai&&<ScoreBadge score={ai.overallScore}/>}</div>
+        </div>
       </div>
 
       {/* inner tabs */}
@@ -1142,6 +1243,12 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
         {/* ── SETTINGS TAB ── */}
         {cardTab==="settings"&&(
           <div style={{maxWidth:620}}>
+            {isDsMotors(client)&&(
+              <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:9,padding:"12px 14px",marginBottom:14,fontSize:12,color:"#166534",lineHeight:1.8}}>
+                <div style={{fontWeight:700,marginBottom:4}}>🔗 חיבור מיוחד ללקוח הזה</div>
+                DS Motors מתפרסם ישירות ל-Supabase של האתר עצמו (לא דרך Worker) — אין צורך למלא Worker URL / Token למטה, השדות האלה לא רלוונטיים ללקוח זה.
+              </div>
+            )}
             <div style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"20px 22px",marginBottom:14}}>
               <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",letterSpacing:1.5,marginBottom:14,textTransform:"uppercase"}}>חיבור לאתר (Cloudflare Worker)</div>
               <div style={{background:"#eff6ff",border:"1px solid #bfdbfe",borderRadius:9,padding:"12px 14px",marginBottom:14,fontSize:12,color:"#1e40af",lineHeight:1.8}}>
@@ -1183,7 +1290,7 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
                 לפני כל פרסום הסוכן יציג אישור עם שם הלקוח, הדומיין וכתובת ה־Worker — כדי למנוע פרסום בטעות לאתר אחר.
               </div>
             </div>
-            <div style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"16px 20px"}}>
+            <div style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"16px 20px",marginBottom:14}}>
               <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",letterSpacing:1.5,marginBottom:10,textTransform:"uppercase"}}>פרטי עסק</div>
               {[["תחום",client.industry],["מיקום",client.location],["קהל יעד",client.targetAudience],["סרוק",new Date(client.scannedAt).toLocaleDateString("he-IL")]].map(([l,v])=>v?(
                 <div key={l} style={{display:"flex",gap:10,padding:"6px 0",borderBottom:"1px solid #f1f5f9",fontSize:13}}>
@@ -1192,9 +1299,38 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
                 </div>
               ):null)}
             </div>
+            <div style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"16px 20px"}}>
+              <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",letterSpacing:1.5,marginBottom:4,textTransform:"uppercase"}}>מה מייחד אתכם</div>
+              <div style={{fontSize:12,color:"#94a3b8",marginBottom:10,lineHeight:1.7}}>
+                יתרונות, שירותים ייחודיים, או מה שמבדל אתכם מהמתחרים — מידע שסריקת האתר לא יכולה תמיד לתפוס. זה יוזרק לכל מאמר שנכתב כדי שהתוכן יהיה ספציפי לעסק שלכם, לא כללי לתחום.
+              </div>
+              <Field name="diff" value={differentiators} onChange={e=>setDifferentiators(e.target.value)} multiline rows={3}
+                placeholder="לדוגמה: 20 שנות ניסיון, אחריות יבואן רשמי, שירות תוך 24 שעות, ליווי אישי לכל לקוח..."/>
+              <div style={{display:"flex",gap:10,alignItems:"center"}}>
+                <button onClick={saveDifferentiators} style={{background:BLUE,color:"#fff",border:"none",borderRadius:8,padding:"9px 20px",fontSize:13,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>שמור</button>
+                {diffSaved&&<span style={{fontSize:12,color:GREEN,fontWeight:600}}>✓ נשמר</span>}
+              </div>
+            </div>
           </div>
         )}
       </div>
+    {/* ── RESCAN MODAL ── */}
+    {rescanState&&(
+      <div style={{position:"fixed",inset:0,background:"#0f172a90",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+        <div style={{background:"#fff",borderRadius:16,padding:"26px 28px",maxWidth:420,width:"100%",direction:"rtl",fontFamily:"Heebo,sans-serif"}}>
+          <div style={{fontSize:16,fontWeight:800,color:ACCENT,marginBottom:14}}>🔄 סורק מחדש</div>
+          <div style={{background:"#f8fafc",borderRadius:9,padding:"12px 14px",marginBottom:14}}>
+            {rescanState.steps.map((s,i)=><StepRow key={i} {...s}/>)}
+          </div>
+          {rescanState.error&&(
+            <div style={{background:"#fef2f2",border:"1px solid #fecaca",borderRadius:8,padding:"9px 13px",fontSize:12,color:RED,marginBottom:12}}>שגיאה: {rescanState.error}</div>
+          )}
+          {rescanState.error&&(
+            <button onClick={()=>setRescanState(null)} style={{background:"#f1f5f9",color:"#64748b",border:"1.5px solid #e2e8f0",borderRadius:8,padding:"9px 18px",fontSize:13,fontWeight:600,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>✕ סגור</button>
+          )}
+        </div>
+      </div>
+    )}
     {/* ── FIX MODAL ── */}
     {fixModal&&(
       <div style={{position:"fixed",inset:0,background:"#0f172a90",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
@@ -1367,7 +1503,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
         "\nArticle type: "+form.articleType+"\n"+
         notesBlock(feedback)+
         ((client?.focusedKeywords||[]).length>0?"\nFocused keywords to integrate: "+(client.focusedKeywords).join(", ")+"\n":"")+
-        styleGuideBlock(client)+
+        styleGuideBlock(client)+clientContextBlock(client)+
         "\n"+
         'Return ONLY valid JSON: {"briefTitle":"...","angle":"...","outline":["...","...","..."],"primaryKeyword":"...","whyThisArticle":"..."}\n'+
         "Keep outline to 3 short items. Write in the client's language. NEVER use double-quote inside string values.";
@@ -1404,7 +1540,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
         "Type: "+tL+" | Tone: "+nL+" | Length: ~"+form.wordCount+" words\n"+
         ((client?.focusedKeywords||[]).length>0?"\nFocused keywords to prioritize: "+(client.focusedKeywords).join(", ")+"\n":"")+
         notesBlock(articleInstructions.trim()||article?.notes||"")+
-        styleGuideBlock(client)+
+        styleGuideBlock(client)+clientContextBlock(client)+
         "\nCurrent year is 2026. Use 2026 in titles and content unless explicitly told otherwise.\n"+
         "\nOUTPUT FORMAT — follow EXACTLY (do not wrap in markdown):\n"+
         "<<<META>>>\n"+
@@ -1435,7 +1571,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
     try{
       const prompt=
         "Revise this SEO article according to the feedback. Keep the same brand voice.\n"+
-        styleGuideBlock(client)+
+        styleGuideBlock(client)+clientContextBlock(client)+
         (revisionNotes.content?.trim()?"\nContent feedback: "+revisionNotes.content.trim()+"\n":"")+
         (revisionNotes.keywords?.trim()?"\nKeywords feedback: "+revisionNotes.keywords.trim()+"\n":"")+
         (revisionNotes.structure?.trim()?"\nStructure feedback: "+revisionNotes.structure.trim()+"\n":"")+
@@ -1481,7 +1617,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
     try{
       const id=persistArticle(result,{status:schedDate?"scheduled":"draft",scheduledDate:schedDate||null});
       const now=new Date().toISOString();
-      const content={title:result.title,metaTitle:result.metaTitle,metaDescription:result.metaDescription,content:result.article,keywords:result.keywords,slug:result.slug};
+      const content={title:result.title,metaTitle:result.metaTitle,metaDescription:result.metaDescription,content:result.article,keywords:result.keywords,slug:result.slug,readTime:result.readTime};
       await pushToWorker(client,{...content,publishedAt:now});
       setPublished(true);
       const prev=DB.getById(effectiveClientId)?.articles?.find(a=>a.id===id);
