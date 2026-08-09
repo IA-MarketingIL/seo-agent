@@ -15,6 +15,8 @@
  *   DELETE /seo-api/articles/:slug — delete article (requires Authorization header)
  *   GET  /seo-api/info             — site metadata for SEO agent scanning (public)
  *   GET  /seo-api/ping             — auth check for SEO agent connection test
+ *   POST /seo-api/image/:slug      — upload a featured image (requires Authorization header)
+ *   GET  /seo-api/image/:slug      — serve an uploaded image (public)
  */
 
 const CORS = {
@@ -89,17 +91,17 @@ export default {
       try { body = await request.json(); }
       catch { return json({ error: "invalid JSON" }, 400); }
 
-      const { slug, title, metaTitle, metaDescription, content, keywords, publishedAt } = body;
+      const { slug, title, metaTitle, metaDescription, content, keywords, publishedAt, featuredImage } = body;
       if (!slug || !title || !content) return json({ error: "slug, title and content are required" }, 400);
 
-      const article = { slug, title, metaTitle, metaDescription, content, keywords: keywords || [], publishedAt: publishedAt || new Date().toISOString() };
+      const article = { slug, title, metaTitle, metaDescription, content, keywords: keywords || [], publishedAt: publishedAt || new Date().toISOString(), featuredImage: featuredImage || null };
 
       await env.SEO_ARTICLES.put("article:" + slug, JSON.stringify(article));
 
       // Update index
       const index = JSON.parse(await env.SEO_ARTICLES.get("index") || "[]");
       const existing = index.findIndex(a => a.slug === slug);
-      const summary = { slug, title, metaTitle, metaDescription, publishedAt: article.publishedAt };
+      const summary = { slug, title, metaTitle, metaDescription, publishedAt: article.publishedAt, featuredImage: article.featuredImage };
       if (existing >= 0) index[existing] = summary;
       else index.unshift(summary);
       await env.SEO_ARTICLES.put("index", JSON.stringify(index));
@@ -115,6 +117,26 @@ export default {
       const index = JSON.parse(await env.SEO_ARTICLES.get("index") || "[]");
       await env.SEO_ARTICLES.put("index", JSON.stringify(index.filter(a => a.slug !== slug)));
       return json({ ok: true });
+    }
+
+    // ── POST /seo-api/image/:slug ───────────────────────────────────
+    const imageMatch = path.match(/^\/seo-api\/image\/(.+)$/);
+    if (request.method === "POST" && imageMatch) {
+      if (!isAuthorized(request, env)) return json({ error: "unauthorized" }, 401);
+      const contentType = request.headers.get("Content-Type") || "application/octet-stream";
+      const bytes = await request.arrayBuffer();
+      if (!bytes.byteLength) return json({ error: "empty upload" }, 400);
+      await env.SEO_ARTICLES.put("image:" + imageMatch[1], bytes, { metadata: { contentType } });
+      return json({ ok: true });
+    }
+
+    // ── GET /seo-api/image/:slug ────────────────────────────────────
+    if (request.method === "GET" && imageMatch) {
+      const stored = await env.SEO_ARTICLES.getWithMetadata("image:" + imageMatch[1], "arrayBuffer");
+      if (!stored.value) return json({ error: "not found" }, 404);
+      return new Response(stored.value, {
+        headers: { ...CORS, "Content-Type": stored.metadata?.contentType || "application/octet-stream", "Cache-Control": "public, max-age=31536000" },
+      });
     }
 
     return json({ error: "not found" }, 404);

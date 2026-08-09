@@ -8,6 +8,8 @@ export async function onRequest({ request, env, next }) {
   const url = new URL(request.url);
 
   if (url.pathname === "/api/login") return next();
+  // Has its own auth (X-Cron-Secret) — GitHub Actions can't hold a browser cookie.
+  if (url.pathname === "/api/publish-scheduled") return next();
   if (!env.AGENT_PASSWORD) return next();
 
   const expected = await sessionToken(env.AGENT_PASSWORD);

@@ -114,6 +114,7 @@ const pushToWorker = async (client, content) => {
         title:content.title, metaDescription:content.metaDescription,
         article:content.content, keywords:content.keywords,
         slug:content.slug, readTime:content.readTime,
+        featuredImage:content.featuredImage,
       }),
     });
     const d=await res.json().catch(()=>({}));
@@ -337,15 +338,74 @@ const uid = () => Math.random().toString(36).slice(2,10);
 const getActiveClients=(activeClientId)=>activeClientId?DB.get().filter(c=>c.id===activeClientId):DB.get();
 
 // ── FULL SITE SCAN PIPELINE (shared by SiteScanner + client-card rescan) ──────
-async function runFullScan({url,seedName,seedIndustry,seedDesc,onStep}){
+// Measured crawl data handed to the model as facts, so the audit describes the
+// real site instead of a plausible-sounding guess.
+const crawlFactsBlock=(crawl)=>{
+  const r=crawl?.raw||{}, s=crawl?.spa||{};
+  let out="\n=== MEASURED FACTS (verified by crawler — treat as ground truth) ===\n";
+  out+="Raw HTML (no JavaScript) visible text: "+(s.rawTextChars??"?")+" characters\n";
+  out+="Fully rendered text: "+(s.renderedTextChars??"?")+" characters\n";
+  if(s.visibleWithoutJsPct!=null)out+="Content visible without JavaScript: "+s.visibleWithoutJsPct+"%\n";
+  out+="Title: "+(r.title?'"'+r.title+'" ('+r.title.length+" chars)":"MISSING")+"\n";
+  out+="Meta description: "+(r.metaDescription?'"'+r.metaDescription+'" ('+r.metaDescription.length+" chars)":"MISSING")+"\n";
+  out+="Canonical: "+(r.canonical||"MISSING")+"\n";
+  out+="Open Graph: title="+(r.ogTitle?"yes":"no")+", description="+(r.ogDescription?"yes":"no")+", image="+(r.ogImage?"yes":"no")+"\n";
+  out+="Structured data (JSON-LD): "+(r.jsonLdCount||0)+" block(s)"+((r.jsonLdTypes||[]).length?" — types: "+r.jsonLdTypes.join(", "):"")+"\n";
+  out+="lang attribute: "+(r.lang||"MISSING")+" | viewport meta: "+(r.hasViewport?"yes":"MISSING")+"\n";
+  out+="robots meta: "+(r.metaRobots||"none")+"\n";
+  return out;
+};
+
+// Deterministic, measured checks — always accurate, never model-generated.
+const buildRenderChecks=(crawl)=>{
+  const r=crawl?.raw||{}, s=crawl?.spa||{};
+  const pct=s.visibleWithoutJsPct;
+  return {
+    category:"רינדור וזמינות לסורקים",
+    items:[
+      {
+        label:"רינדור בצד שרת",
+        status:s.clientSideRendered?"error":"good",
+        value:s.clientSideRendered?"רינדור בצד לקוח":"תוכן קיים ב-HTML",
+        detail:s.clientSideRendered
+          ? "התוכן נבנה ב-JavaScript. סורקים שלא מריצים JS רואים "+(pct!=null?pct+"% ":"כמעט 0% ")+"מהתוכן. שקול SSR / Prerender."
+          : "התוכן זמין ישירות ב-HTML — כל הסורקים רואים אותו.",
+      },
+      {
+        label:"H1 ב-HTML הגולמי",
+        status:(r.h1Count||0)>0?"good":"error",
+        value:String(r.h1Count||0),
+        detail:(r.h1Count||0)>0
+          ? "נמצאה כותרת H1: "+(r.h1First||"")
+          : "אין H1 ב-HTML שמגיע מהשרת — כותרת ראשית היא מאותות הדירוג הבסיסיים.",
+      },
+      {
+        label:"Meta Description ב-HTML הגולמי",
+        status:r.metaDescription?(r.metaDescription.length>=70&&r.metaDescription.length<=160?"good":"warning"):"error",
+        value:r.metaDescription?r.metaDescription.length+" תווים":"חסר",
+        detail:r.metaDescription
+          ? (r.metaDescription.length>160?"ארוך מדי — גוגל יקצץ. מומלץ 70-160 תווים.":r.metaDescription.length<70?"קצר מדי — מומלץ 70-160 תווים.":"באורך תקין.")
+          : "אין meta description ב-HTML מהשרת.",
+      },
+    ],
+  };
+};
+
+async function runFullScan({url,seedName,seedIndustry,seedDesc,onStep,skipSuggestions}){
   const u=url.trim().startsWith("http")?url.trim():"https://"+url.trim();
   const step=(i,st)=>onStep?.(i,st);
 
-  let pageContent="";
-  try{
-    const r=await fetch("https://r.jina.ai/"+u,{signal:AbortSignal.timeout(9000),headers:{"Accept":"text/plain"}});
-    if(r.ok)pageContent=(await r.text()).slice(0,4500);
-  }catch{}
+  // Server-side crawl: raw HTML + JS-rendered content + real measurements.
+  // A failure here is fatal on purpose — auditing with no content used to
+  // produce confident findings that the model had simply invented.
+  const crawlRes=await fetch("/api/crawl",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({url:u}),
+  });
+  const crawl=await crawlRes.json().catch(()=>({}));
+  if(!crawlRes.ok||!crawl.ok)throw new Error(crawl.error||"סריקת האתר נכשלה");
+  const pageContent=crawl.rendered?.content||"";
   step(0,"done");step(1,"loading");
 
   const extractPrompt=
@@ -385,20 +445,23 @@ async function runFullScan({url,seedName,seedIndustry,seedDesc,onStep}){
   }catch{}
   step(2,"done");step(3,"loading");
 
-  const suggestPrompt=
-    "You are an Israeli SEO expert. Suggest 8 blog articles.\n"+
-    "Industry: "+extracted.industry+"\nBusiness: "+extracted.businessName+"\nLocation: "+(extracted.location||"ישראל")+
-    "\nDescription: "+(seedDesc||extracted.businessDescription)+"\nTarget audience: "+extracted.targetAudience+
-    "\nKeywords: "+(extracted.mainKeywords||[]).join(", ")+"\n"+
-    styleGuideBlock({styleGuide})+"\n"+
-    "All 8 articles must be strictly about '"+extracted.industry+"'. Mix types.\n"+
-    "Include at least 2 local articles targeting: "+(extracted.location||"האזור")+"\n\n"+
-    "Return ONLY valid JSON:\n"+
-    '{"suggestions":[{"title":"Hebrew title","keywords":"Hebrew keywords","type":"informational","reason":"Hebrew SEO reason","priority":"high"}]}\n'+
-    "Types: informational, commercial, local, howto. All values in Hebrew. NEVER use double-quote inside string values.";
+  let suggested={suggestions:[]};
+  if(!skipSuggestions){
+    const suggestPrompt=
+      "You are an Israeli SEO expert. Suggest 8 blog articles.\n"+
+      "Industry: "+extracted.industry+"\nBusiness: "+extracted.businessName+"\nLocation: "+(extracted.location||"ישראל")+
+      "\nDescription: "+(seedDesc||extracted.businessDescription)+"\nTarget audience: "+extracted.targetAudience+
+      "\nKeywords: "+(extracted.mainKeywords||[]).join(", ")+"\n"+
+      styleGuideBlock({styleGuide})+"\n"+
+      "All 8 articles must be strictly about '"+extracted.industry+"'. Mix types.\n"+
+      "Include at least 2 local articles targeting: "+(extracted.location||"האזור")+"\n\n"+
+      "Return ONLY valid JSON:\n"+
+      '{"suggestions":[{"title":"Hebrew title","keywords":"Hebrew keywords","type":"informational","reason":"Hebrew SEO reason","priority":"high"}]}\n'+
+      "Types: informational, commercial, local, howto. All values in Hebrew. NEVER use double-quote inside string values.";
 
-  const suggestTxt=await callClaude(suggestPrompt,2000);
-  const suggested=parseJSON(suggestTxt);
+    const suggestTxt=await callClaude(suggestPrompt,2000);
+    suggested=parseJSON(suggestTxt);
+  }
   step(3,"done");step(4,"loading");
 
   const loc=extracted.location||"ישראל";
@@ -412,7 +475,10 @@ async function runFullScan({url,seedName,seedIndustry,seedDesc,onStep}){
   const auditPrompt=
     "You are a technical SEO expert. Perform a quick SEO audit.\n"+
     "URL: "+u+"\nBusiness: "+extracted.businessName+"\nIndustry: "+extracted.industry+"\n"+
-    (pageContent?"\nPage content:\n"+pageContent.slice(0,1500)+"\n":"")+
+    crawlFactsBlock(crawl)+
+    (pageContent?"\nRendered page content:\n"+pageContent.slice(0,2500)+"\n":"")+
+    "\nBase every finding on the MEASURED FACTS above — do not invent values you were not given.\n"+
+    "Do NOT include findings about client-side rendering, H1 in raw HTML, or meta description in raw HTML — those are reported separately.\n"+
     "\nReturn ONLY valid JSON with this EXACT structure:\n"+
     '{"overallScore":72,"grade":"B","summary":"קצר עד 20 מילה","checks":[{"category":"מטא-דאטה","items":[{"label":"Meta Title","status":"good","value":"val","detail":"הסבר"}]},{"category":"תוכן","items":[{"label":"איכות תוכן","status":"warning","value":"val","detail":"הסבר"}]},{"category":"טכני","items":[{"label":"מהירות","status":"good","value":"val","detail":"הסבר"}]}],"topIssues":["בעיה1","בעיה2","בעיה3"],"quickWins":["פעולה1","פעולה2","פעולה3"]}\n'+
     "Exactly 3 categories, exactly 3 items each. Keep Hebrew strings SHORT (under 15 words). NEVER use double-quote inside string values.";
@@ -423,6 +489,12 @@ async function runFullScan({url,seedName,seedIndustry,seedDesc,onStep}){
   ]);
   const kwData=parseJSON(kwTxt);
   const auditData=parseJSON(auditTxt);
+  // Measured checks go first — they're facts, the rest is model interpretation.
+  auditData.checks=[buildRenderChecks(crawl),...(auditData.checks||[])];
+  if(crawl.spa?.clientSideRendered){
+    const warn="האתר מרונדר בצד לקוח — סורקים ללא JavaScript רואים "+(crawl.spa.visibleWithoutJsPct??0)+"% מהתוכן";
+    auditData.topIssues=[warn,...(auditData.topIssues||[])].slice(0,5);
+  }
   step(4,"done");
 
   let domain=u; try{domain=new URL(u).hostname;}catch{}
@@ -441,6 +513,8 @@ async function runFullScan({url,seedName,seedIndustry,seedDesc,onStep}){
     existingTopics:extracted.existingTopics||[],
     keywordResearch:kwData.keywords||[],
     audit:auditData, articles, styleGuide,
+    // Facts only — the rendered body is too large to persist per client.
+    crawlFacts:{raw:crawl.raw,spa:crawl.spa,crawledAt:new Date().toISOString()},
   };
 }
 const SCAN_STEPS=[
@@ -586,20 +660,14 @@ function SiteScanner({onClientSaved}){
 }
 
 // ── CLIENT MANAGER ────────────────────────────────────────────────────────────
-function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
+function ClientManager({initialOpenId,onSelectClient}){
   const [clients,setClients]=useState(DB.get());
   const [openId,setOpenId]=useState(initialOpenId||null);
-  const [cardTab,setCardTab]=useState("articles");
-  const [customDir,setCustomDir]=useState("");
-  const [addingCustom,setAddingCustom]=useState(false);
-  const [genBriefId,setGenBriefId]=useState(null);
-  const [previewArticle,setPreviewArticle]=useState(null);
+  const [cardTab,setCardTab]=useState("style");
   const [regenTipsLoading,setRegenTipsLoading]=useState(false);
   const initialClient=initialOpenId?DB.getById(initialOpenId):null;
   const [focusedKeywords,setFocusedKeywords]=useState(initialClient?.focusedKeywords||[]);
   const [fixModal,setFixModal]=useState(null);
-  const [versionsModal,setVersionsModal]=useState(null);
-  const [reverting,setReverting]=useState(false);
   const [styleGuide,setStyleGuide]=useState(initialClient?.styleGuide||{language:"he",toneNotes:"",audienceNotes:"",writingRules:"",doNot:"",sampleArticles:[]});
   const [seoFocus,setSeoFocus]=useState(initialClient?.seoFocus||{tipNotes:"",avoidTips:"",priorities:""});
   const [differentiators,setDifferentiators]=useState(initialClient?.differentiators||"");
@@ -640,7 +708,7 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
     setSeoFocus(c?.seoFocus||{tipNotes:"",avoidTips:"",priorities:""});
     setDifferentiators(c?.differentiators||"");
     setConnMsg("");setConnOk(null);setSettingsSaved(false);
-    setOpenId(id); setCardTab("articles");
+    setOpenId(id); setCardTab("style");
     onSelectClient?.(id);
   };
 
@@ -751,16 +819,13 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
     setRescanState({steps:SCAN_STEPS.map((s,i)=>({...s,status:i===0?"loading":"idle"})),error:null});
     const stepUpd=(i,st)=>setRescanState(s=>s?{...s,steps:s.steps.map((x,idx)=>idx===i?{...x,status:st}:x)}:s);
     try{
-      const result=await runFullScan({url:c.url,seedName:c.name,seedIndustry:c.industry,seedDesc:c.businessDescription,onStep:stepUpd});
-      const existingArticles=c.articles||[];
-      const newOnes=result.articles.filter(na=>!existingArticles.some(ea=>ea.title===na.title));
+      const result=await runFullScan({url:c.url,seedName:c.name,seedIndustry:c.industry,seedDesc:c.businessDescription,onStep:stepUpd,skipSuggestions:true});
       const upd={
         industry:result.industry, location:result.location,
         mainKeywords:result.mainKeywords, targetAudience:result.targetAudience,
         businessDescription:result.businessDescription, competitors:result.competitors,
         existingTopics:result.existingTopics, keywordResearch:result.keywordResearch,
-        audit:result.audit, scannedAt:new Date().toISOString(),
-        articles:[...newOnes,...existingArticles],
+        audit:result.audit, crawlFacts:result.crawlFacts, scannedAt:new Date().toISOString(),
       };
       if(refreshStyle)upd.styleGuide=result.styleGuide;
       DB.update(openId,upd);
@@ -769,77 +834,6 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
     }catch(e){
       setRescanState(s=>s?{...s,error:e.message}:s);
     }
-  };
-
-  const revertVersion=async(article,version)=>{
-    const c=DB.getById(openId);
-    if(!getPublishTarget(c)){alert("הגדר Worker URL ו-Auth Token בהגדרות הלקוח");return;}
-    if(!confirmPublish(c,version.title||article.title))return;
-    setReverting(true);
-    try{
-      const now=new Date().toISOString();
-      await pushToWorker(c,{title:version.title,metaTitle:version.metaTitle,metaDescription:version.metaDescription,content:version.content,keywords:version.keywords,slug:version.slug,publishedAt:now});
-      const remaining=(article.versions||[]).filter(v=>v.version!==version.version);
-      const archived={...article.publishedContent,publishedAt:article.publishedAt,version:(article.versions?.length||0)+1};
-      DB.updateArticle(openId,article.id,{
-        publishedAt:now, slug:version.slug,
-        publishedContent:{title:version.title,metaTitle:version.metaTitle,metaDescription:version.metaDescription,content:version.content,keywords:version.keywords,slug:version.slug},
-        versions:[...remaining,archived],
-      });
-      setVersionsModal(null);
-      refresh();
-    }catch(e){alert("שגיאה בשחזור: "+e.message);}
-    setReverting(false);
-  };
-
-  const addCustomArticle=async()=>{
-    if(!customDir.trim()||!openId)return;
-    setAddingCustom(true);
-    try{
-      const c=DB.getById(openId);
-      const prompt=
-        "Create an SEO article brief based on this custom direction.\n\n"+
-        "Custom direction: "+customDir+"\n"+
-        "Industry: "+c.industry+"\nLocation: "+(c.location||"ישראל")+"\nBusiness: "+c.name+"\nKeywords: "+(c.mainKeywords||[]).join(", ")+"\n"+
-        ((c.focusedKeywords||[]).length>0?"Focused keywords to integrate: "+c.focusedKeywords.join(", ")+"\n":"")+
-        styleGuideBlock(c)+clientContextBlock(c)+"\n"+
-        'Return ONLY valid JSON: {"title":"...","keywords":"...","type":"informational","brief":{"briefTitle":"...","angle":"...","outline":["...","...","..."],"primaryKeyword":"...","whyThisArticle":"..."}}\n'+
-        "Keep outline to 3 short items. Write values in the client's language. NEVER use double-quote inside string values.";
-      const txt=await callClaude(prompt,1500);
-      const data=parseJSON(txt);
-      const article={
-        id:uid(), title:data.title||customDir, keywords:data.keywords||"",
-        type:data.type||"informational", reason:"מאמר מותאם אישית", priority:"high",
-        status:"briefed", source:"custom", brief:data.brief||null, notes:"",
-        draftContent:null, scheduledDate:null, publishedAt:null, slug:"",
-      };
-      DB.addArticle(openId,article);
-      setCustomDir("");
-    }catch(e){alert("שגיאה: "+e.message);}
-    setAddingCustom(false);
-    refresh();
-  };
-
-  const scheduleArticle=(articleId,date)=>{
-    const art=DB.getById(openId)?.articles?.find(a=>a.id===articleId);
-    if(date&&!hasFullArticle(art)){
-      alert("אפשר לתזמן רק אחרי שיש מאמר מלא (לא רק תקציר). לחץ 'כתוב מאמר מלא' קודם.");
-      return;
-    }
-    const nextStatus=date?"scheduled":(hasFullArticle(art)?"draft":"briefed");
-    DB.updateArticle(openId,articleId,{scheduledDate:date||null,status:nextStatus});
-    refresh();
-  };
-
-  const deleteArticle=(articleId)=>{
-    if(!confirm("למחוק את המאמר?"))return;
-    DB.deleteArticle(openId,articleId);
-    refresh();
-  };
-
-  const saveArticleNotes=(articleId,notes)=>{
-    DB.updateArticle(openId,articleId,{notes});
-    refresh();
   };
 
   const saveStyleGuide=()=>{
@@ -874,28 +868,6 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
     setRegenTipsLoading(false);
   };
 
-  const regenerateBriefFromNotes=async(article)=>{
-    if(!openId||!article)return;
-    setGenBriefId(article.id);
-    try{
-      const c=DB.getById(openId);
-      const prompt=
-        "Create an SEO article brief.\n\n"+
-        "Topic: "+article.title+"\nKeywords: "+(article.keywords||"")+
-        "\nIndustry: "+(c.industry||"")+"\nLocation: "+(c.location||"")+
-        "\nArticle type: "+(article.type||"informational")+
-        notesBlock(article.notes)+
-        ((c.focusedKeywords||[]).length>0?"\nFocused keywords: "+c.focusedKeywords.join(", ")+"\n":"")+
-        styleGuideBlock(c)+clientContextBlock(c)+
-        "\nReturn ONLY valid JSON: {\"briefTitle\":\"...\",\"angle\":\"...\",\"outline\":[\"...\",\"...\",\"...\"],\"primaryKeyword\":\"...\",\"whyThisArticle\":\"...\"}\n"+
-        "Keep outline to 3 short items. Write in the client's language. NEVER use double-quote inside string values.";
-      const txt=await callClaude(prompt,1500);
-      const b=parseJSON(txt);
-      DB.updateArticle(openId,article.id,{brief:b,status:"briefed"});
-      refresh();
-    }catch(e){alert("שגיאה: "+e.message);}
-    setGenBriefId(null);
-  };
 
   const formatDate=(d)=>formatDateTime(d);
 
@@ -987,103 +959,12 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
 
       {/* inner tabs */}
       <div style={{background:"#fff",borderBottom:"1px solid #e2e8f0",padding:"0 24px",display:"flex",gap:2,flexShrink:0}}>
-        {[["articles","📝 מאמרים"],["style","✍ סגנון כתיבה"],["keywords","🔑 מילות מפתח"],["audit","🛡 אודיט"],["settings","⚙ הגדרות"]].map(([k,l])=>(
+        {[["style","✍ סגנון כתיבה"],["keywords","🔑 מילות מפתח"],["audit","🛡 אודיט"],["settings","⚙ הגדרות"]].map(([k,l])=>(
           <button key={k} onClick={()=>setCardTab(k)} style={{padding:"10px 16px",border:"none",borderBottom:cardTab===k?`2px solid ${BLUE}`:"2px solid transparent",background:"transparent",fontSize:13,fontWeight:cardTab===k?700:400,color:cardTab===k?BLUE:"#64748b",cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>{l}</button>
         ))}
       </div>
 
       <div style={{flex:1,overflowY:"auto",padding:"20px 24px",background:"#f8fafc"}}>
-
-        {/* ── ARTICLES TAB ── */}
-        {cardTab==="articles"&&(
-          <div style={{maxWidth:800}}>
-            {/* custom article form */}
-            <div style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"16px 20px",marginBottom:18}}>
-              <div style={{fontSize:12,fontWeight:700,color:"#94a3b8",letterSpacing:1.5,marginBottom:10,textTransform:"uppercase"}}>הוסף מאמר מותאם אישית</div>
-              <Field name="dir" value={customDir} onChange={e=>setCustomDir(e.target.value)}
-                placeholder="לדוגמה: רוצה מאמר על יתרונות מצלמות IP לעסקים קטנים באזור הצפון..."
-                multiline rows={2}/>
-              <button onClick={addCustomArticle} disabled={addingCustom||!customDir.trim()}
-                style={{background:addingCustom?"#94a3b8":ACCENT,color:"#fff",border:"none",borderRadius:8,padding:"9px 18px",fontSize:13,fontWeight:700,cursor:addingCustom?"not-allowed":"pointer",fontFamily:"Heebo,sans-serif"}}>
-                {addingCustom?<span style={{display:"flex",alignItems:"center",gap:6}}><Spin color="#fff" size={13}/>יוצר...</span>:"+ צור תקציר"}
-              </button>
-            </div>
-
-            {/* articles list */}
-            <div style={{display:"flex",flexDirection:"column",gap:10}}>
-              {articles.length===0&&<div style={{textAlign:"center",padding:30,color:"#94a3b8",fontSize:13,fontFamily:"Heebo,sans-serif"}}>אין מאמרים עדיין</div>}
-              {articles.map(a=>(
-                <div key={a.id} style={{background:"#fff",borderRadius:10,border:"1px solid #e2e8f0",padding:"14px 18px"}}>
-                  <div style={{display:"flex",alignItems:"flex-start",gap:10,flexWrap:"wrap"}}>
-                    <div style={{flex:1}}>
-                      <div style={{fontSize:14,fontWeight:700,color:ACCENT,fontFamily:"Heebo,sans-serif",marginBottom:4}}>{a.title}</div>
-                      <div style={{fontSize:11,color:"#64748b",marginBottom:6}}>{a.keywords}</div>
-                      <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
-                        <StatusBadge status={a.status}/>
-                        {a.source==="custom"&&<span style={{background:"#fdf4ff",color:PURPLE,border:`1px solid ${PURPLE}35`,borderRadius:20,padding:"2px 9px",fontSize:10,fontWeight:700}}>מותאם</span>}
-                        {a.draftContent&&<span style={{background:GREEN+"14",color:GREEN,border:`1px solid ${GREEN}35`,borderRadius:20,padding:"2px 9px",fontSize:10,fontWeight:700}}>יש טיוטה</span>}
-                        {a.scheduledDate&&<span style={{fontSize:12,color:PURPLE,fontWeight:600}}>📅 {formatDate(a.scheduledDate)}</span>}
-                        {a.publishedAt&&<span style={{fontSize:12,color:GREEN,fontWeight:600}}>✓ פורסם {formatDate(a.publishedAt)}</span>}
-                      </div>
-                    </div>
-                    <div style={{display:"flex",gap:8,flexShrink:0,alignItems:"center",flexWrap:"wrap"}}>
-                      {a.status!=="published"&&hasFullArticle(a)&&(
-                        <input type="datetime-local" value={toDatetimeLocal(a.scheduledDate)} onChange={e=>scheduleArticle(a.id,e.target.value)}
-                          style={{padding:"5px 9px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:12,color:ACCENT,outline:"none",direction:"ltr"}} title="תזמון ללוח פרסום"/>
-                      )}
-                      {a.status!=="published"&&!hasFullArticle(a)&&(
-                        <span style={{fontSize:11,color:"#94a3b8",background:"#f8fafc",border:"1px solid #e2e8f0",borderRadius:7,padding:"5px 9px"}}>תזמון אחרי מאמר מלא</span>
-                      )}
-                      {(a.draftContent||a.publishedContent)&&(
-                        <button onClick={()=>setPreviewArticle(a)}
-                          style={{background:"#f1f5f9",color:ACCENT,border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
-                          📄 צפה
-                        </button>
-                      )}
-                      {(a.versions||[]).length>0&&a.status==="published"&&(
-                        <button onClick={()=>setVersionsModal({article:a})}
-                          style={{background:"#f1f5f9",color:"#64748b",border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
-                          🕐 היסטוריה ({a.versions.length})
-                        </button>
-                      )}
-                      <button onClick={()=>onWriteArticle(client.id,a.id)}
-                        style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer",fontFamily:"Heebo,sans-serif"}}>
-                        {a.draftContent||a.publishedContent?"✏ ערוך מאמר":"✦ כתוב מאמר מלא"}
-                      </button>
-                      <button onClick={()=>deleteArticle(a.id)}
-                        style={{background:"#fef2f2",color:RED,border:"1px solid #fecaca",borderRadius:7,padding:"7px 10px",fontSize:12,fontWeight:700,cursor:"pointer"}}>
-                        🗑
-                      </button>
-                    </div>
-                  </div>
-                  {a.reason&&!a.brief&&(
-                    <div style={{marginTop:8,fontSize:12,color:"#64748b",lineHeight:1.6,fontFamily:"Heebo,sans-serif"}}>{a.reason}</div>
-                  )}
-                  {a.brief&&(
-                    <div style={{marginTop:10,background:"#f8fafc",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#64748b",fontFamily:"Heebo,sans-serif"}}>
-                      <div style={{fontWeight:700,color:ACCENT,marginBottom:4}}>{a.brief.angle||a.brief.briefTitle}</div>
-                      {(a.brief.outline||[]).map((p,i)=><div key={i}>• {p}</div>)}
-                    </div>
-                  )}
-                  {a.status!=="published"&&(
-                    <div style={{marginTop:10}}>
-                      <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",letterSpacing:1,marginBottom:5,textTransform:"uppercase"}}>הערות / תיקונים</div>
-                      <textarea value={a.notes||""} onChange={e=>saveArticleNotes(a.id,e.target.value)}
-                        placeholder="לדוגמה: שנה 2025 ל-2026, הדגש דגם 1000, אל תזכיר מתחרים..."
-                        rows={2} style={{width:"100%",padding:"8px 11px",border:"1.5px solid #e2e8f0",borderRadius:8,fontSize:12,fontFamily:"Heebo,sans-serif",resize:"vertical",outline:"none",boxSizing:"border-box",direction:"rtl",background:a.notes?"#fffbeb":"#fff"}}/>
-                      {a.notes?.trim()&&(
-                        <button onClick={()=>regenerateBriefFromNotes(a)} disabled={genBriefId===a.id}
-                          style={{marginTop:6,background:genBriefId===a.id?"#94a3b8":AMBER,color:"#fff",border:"none",borderRadius:7,padding:"6px 12px",fontSize:11,fontWeight:700,cursor:genBriefId===a.id?"not-allowed":"pointer",fontFamily:"Heebo,sans-serif"}}>
-                          {genBriefId===a.id?<span style={{display:"flex",alignItems:"center",gap:5}}><Spin color="#fff" size={11}/>מעדכן...</span>:"↻ עדכן תקציר לפי הערות"}
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
 
         {/* ── STYLE GUIDE TAB ── */}
         {cardTab==="style"&&(
@@ -1362,62 +1243,6 @@ function ClientManager({onWriteArticle,initialOpenId,onSelectClient}){
         </div>
       </div>
     )}
-
-    {/* ── VERSIONS MODAL ── */}
-    {versionsModal&&(
-      <div style={{position:"fixed",inset:0,background:"#0f172a90",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
-        <div style={{background:"#fff",borderRadius:16,padding:"26px 28px",maxWidth:600,width:"100%",maxHeight:"80vh",overflowY:"auto",direction:"rtl",fontFamily:"Heebo,sans-serif"}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
-            <div style={{fontSize:16,fontWeight:800,color:ACCENT}}>🕐 היסטוריית גרסאות</div>
-            <button onClick={()=>setVersionsModal(null)} style={{background:"#f1f5f9",border:"none",borderRadius:7,padding:"6px 12px",fontSize:12,fontWeight:700,cursor:"pointer",color:"#64748b"}}>✕ סגור</button>
-          </div>
-          <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:9,padding:"10px 14px",marginBottom:14,fontSize:12,color:"#166534"}}>
-            גרסה נוכחית: {versionsModal.article.publishedContent?.title||versionsModal.article.title} · פורסם {formatDate(versionsModal.article.publishedAt)}
-          </div>
-          <div style={{display:"flex",flexDirection:"column",gap:10}}>
-            {[...(versionsModal.article.versions||[])].sort((a,b)=>b.version-a.version).map(v=>(
-              <div key={v.version} style={{border:"1px solid #e2e8f0",borderRadius:10,padding:"12px 16px"}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}}>
-                  <div>
-                    <div style={{fontSize:13,fontWeight:700,color:ACCENT}}>{v.title}</div>
-                    <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>פורסם {formatDate(v.publishedAt)}</div>
-                  </div>
-                  <button onClick={()=>revertVersion(versionsModal.article,v)} disabled={reverting}
-                    style={{background:reverting?"#94a3b8":AMBER,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:reverting?"not-allowed":"pointer",flexShrink:0}}>
-                    ↩ שחזר גרסה זו
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-    )}
-
-    {/* ── ARTICLE PREVIEW MODAL ── */}
-    {previewArticle&&(
-      <div style={{position:"fixed",inset:0,background:"#0f172a90",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
-        <div style={{background:"#fff",borderRadius:16,padding:"26px 28px",maxWidth:720,width:"100%",maxHeight:"85vh",overflowY:"auto",direction:"rtl",fontFamily:"Heebo,sans-serif"}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",gap:12,marginBottom:16}}>
-            <div>
-              <div style={{fontSize:18,fontWeight:800,color:ACCENT,marginBottom:4}}>{previewArticle.draftContent?.title||previewArticle.publishedContent?.title||previewArticle.title}</div>
-              <div style={{fontSize:11,color:"#94a3b8",direction:"ltr"}}>/{previewArticle.draftContent?.slug||previewArticle.slug||""}</div>
-            </div>
-            <div style={{display:"flex",gap:8}}>
-              <button onClick={()=>{onWriteArticle(client.id,previewArticle.id);setPreviewArticle(null);}}
-                style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:"pointer"}}>✏ ערוך</button>
-              <button onClick={()=>setPreviewArticle(null)} style={{background:"#f1f5f9",border:"none",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer",color:"#64748b"}}>✕</button>
-            </div>
-          </div>
-          {(previewArticle.draftContent?.metaDescription||previewArticle.publishedContent?.metaDescription)&&(
-            <div style={{background:"#f8fafc",borderRadius:8,padding:"10px 14px",marginBottom:14,fontSize:13,color:"#64748b"}}>
-              {previewArticle.draftContent?.metaDescription||previewArticle.publishedContent?.metaDescription}
-            </div>
-          )}
-          <ArticleView text={articleBody(previewArticle)}/>
-        </div>
-      </div>
-    )}
     </div>
   );
 }
@@ -1452,6 +1277,11 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
   const [revisionNotes,setRevisionNotes]=useState(article?.revisionNotes||{content:"",keywords:"",structure:""});
   const [revising,setRevising]=useState(false);
   const [saveMsg,setSaveMsg]=useState("");
+  const [imagePrompt,setImagePrompt]=useState("");
+  const [showImagePrompt,setShowImagePrompt]=useState(false);
+  const [imageGenerating,setImageGenerating]=useState(false);
+  const [imageUploading,setImageUploading]=useState(false);
+  const [imageError,setImageError]=useState("");
 
   const effectiveClientId=resolvedClientId||clientId;
 
@@ -1589,12 +1419,24 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
     setRevising(false);
   };
 
+  // After a save the article lives in the Articles page / calendar — clear the
+  // writer so the next visit starts blank instead of re-opening the same draft.
+  const resetWriter=()=>{
+    setResult(null);setBrief(null);setBoundArticleId(null);
+    setForm(f=>({...f,topic:"",keywords:""}));
+    setArticleInstructions("");setShowInstructions(false);
+    setRevisionNotes({content:"",keywords:"",structure:""});
+    setSchedDate("");setPublished(false);setError(null);setTab("article");
+    setImagePrompt("");setShowImagePrompt(false);setImageError("");
+  };
+
   const saveDraft=()=>{
     if(!result){setError("אין מאמר לשמירה");return;}
     try{
       persistArticle(result,{status:schedDate?"scheduled":"draft",scheduledDate:schedDate||null,revisionNotes});
-      setSaveMsg("המאמר נשמר בעמוד המאמרים");
-      setError(null);
+      onSaved?.();
+      resetWriter();
+      setSaveMsg("המאמר נשמר בעמוד המאמרים — המסך מוכן למאמר חדש");
     }catch(e){setError(e.message);}
   };
 
@@ -1603,9 +1445,60 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
     if(!schedDate){setError("בחר תאריך ושעה לתזמון");return;}
     try{
       persistArticle(result,{status:"scheduled",scheduledDate:schedDate,revisionNotes});
-      setSaveMsg("המאמר נשמר ותוזמן ללוח הפרסום");
-      setError(null);
+      onSaved?.();
+      resetWriter();
+      setSaveMsg("המאמר נשמר ותוזמן ללוח הפרסום — המסך מוכן למאמר חדש");
     }catch(e){setError(e.message);}
+  };
+
+  const saveImageUrl=(url)=>{
+    setResult(r=>({...r,featuredImage:url}));
+    try{
+      persistArticle({...result,featuredImage:url},{
+        status:article?.status==="published"?"published":(schedDate?"scheduled":"draft"),
+        scheduledDate:schedDate||null,
+      });
+    }catch{}
+  };
+
+  const generateImage=async()=>{
+    if(!result?.slug){setImageError("צור מאמר קודם");return;}
+    if(!imagePrompt.trim()){setImageError("נא לתאר את התמונה הרצויה");return;}
+    setImageGenerating(true);setImageError("");
+    try{
+      const res=await fetch("/api/generate-image",{
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({prompt:imagePrompt.trim(),domain:client?.domain||"",workerUrl:client?.workerUrl||"",token:client?.token||"",slug:result.slug}),
+      });
+      const d=await res.json();
+      if(!res.ok||!d.url)throw new Error(d.error||"יצירת התמונה נכשלה");
+      saveImageUrl(d.url);
+      setShowImagePrompt(false);setImagePrompt("");
+    }catch(e){setImageError(e.message);}
+    setImageGenerating(false);
+  };
+
+  const uploadImage=async(file)=>{
+    if(!result?.slug){setImageError("צור מאמר קודם");return;}
+    if(!file)return;
+    setImageUploading(true);setImageError("");
+    try{
+      const res=await fetch("/api/upload-image?slug="+encodeURIComponent(result.slug),{
+        method:"POST",
+        headers:{
+          "Content-Type":file.type||"application/octet-stream",
+          "X-Client-Domain":client?.domain||"",
+          "X-Worker-Url":client?.workerUrl||"",
+          "X-Worker-Token":client?.token||"",
+        },
+        body:file,
+      });
+      const d=await res.json();
+      if(!res.ok||!d.url)throw new Error(d.error||"העלאת התמונה נכשלה");
+      saveImageUrl(d.url);
+    }catch(e){setImageError(e.message);}
+    setImageUploading(false);
   };
 
   const publishArticle=async()=>{
@@ -1617,7 +1510,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
     try{
       const id=persistArticle(result,{status:schedDate?"scheduled":"draft",scheduledDate:schedDate||null});
       const now=new Date().toISOString();
-      const content={title:result.title,metaTitle:result.metaTitle,metaDescription:result.metaDescription,content:result.article,keywords:result.keywords,slug:result.slug,readTime:result.readTime};
+      const content={title:result.title,metaTitle:result.metaTitle,metaDescription:result.metaDescription,content:result.article,keywords:result.keywords,slug:result.slug,readTime:result.readTime,featuredImage:result.featuredImage||null};
       await pushToWorker(client,{...content,publishedAt:now});
       setPublished(true);
       const prev=DB.getById(effectiveClientId)?.articles?.find(a=>a.id===id);
@@ -1706,6 +1599,9 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
       <div style={{flex:1,padding:"22px 26px",overflowY:"auto"}}>
         {!brief&&!briefLoading&&!result&&!loading&&(
           <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100%",gap:12,textAlign:"center"}}>
+            {saveMsg&&(
+              <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:9,padding:"10px 16px",fontSize:13,color:GREEN,fontWeight:600,marginBottom:6}}>✓ {saveMsg}</div>
+            )}
             <div style={{fontSize:44,opacity:.2}}>✦</div>
             <div style={{fontSize:17,fontWeight:700,color:"#cbd5e1"}}>כתיבת תוכן SEO</div>
             <div style={{fontSize:13,color:"#94a3b8",maxWidth:300,lineHeight:1.8}}>הזן נושא ומילות מפתח ולחץ 'צור תקציר'</div>
@@ -1797,6 +1693,46 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
               <button onClick={saveDraft} style={{background:ACCENT,color:"#fff",border:"none",borderRadius:8,padding:"9px 16px",fontSize:13,fontWeight:700,cursor:"pointer"}}>💾 שמור בעמוד מאמרים</button>
               <button onClick={saveAndSchedule} style={{background:PURPLE,color:"#fff",border:"none",borderRadius:8,padding:"9px 16px",fontSize:13,fontWeight:700,cursor:"pointer"}}>📅 שמור ותזמן ללוח</button>
             </div>
+
+            {/* ── FEATURED IMAGE ── */}
+            <div style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:10,padding:"14px 16px",marginBottom:16}}>
+              <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",letterSpacing:1,marginBottom:10,textTransform:"uppercase"}}>🖼 תמונה ראשית</div>
+              {result.featuredImage?(
+                <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
+                  <img src={result.featuredImage} alt="" style={{width:120,height:80,objectFit:"cover",borderRadius:8,border:"1px solid #e2e8f0"}}/>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                    <button onClick={()=>setShowImagePrompt(true)} style={{background:"#f1f5f9",color:ACCENT,border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 13px",fontSize:12,fontWeight:700,cursor:"pointer"}}>✨ צור תמונה חדשה</button>
+                    <label style={{background:"#f1f5f9",color:ACCENT,border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 13px",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+                      📤 החלף מהמחשב
+                      <input type="file" accept="image/*" style={{display:"none"}} onChange={e=>uploadImage(e.target.files?.[0])}/>
+                    </label>
+                    <button onClick={()=>saveImageUrl(null)} style={{background:"transparent",color:RED,border:"1px solid #fecaca",borderRadius:7,padding:"7px 13px",fontSize:12,fontWeight:700,cursor:"pointer"}}>🗑 הסר</button>
+                  </div>
+                </div>
+              ):(
+                <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
+                  <button onClick={()=>setShowImagePrompt(true)} disabled={imageGenerating} style={{background:imageGenerating?"#94a3b8":ACCENT,color:"#fff",border:"none",borderRadius:7,padding:"8px 14px",fontSize:12,fontWeight:700,cursor:imageGenerating?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:6}}>
+                    {imageGenerating?<><Spin color="#fff" size={12}/>יוצר תמונה...</>:"✨ צור עם AI"}
+                  </button>
+                  <label style={{background:imageUploading?"#94a3b8":"#f1f5f9",color:imageUploading?"#fff":ACCENT,border:"1px solid #e2e8f0",borderRadius:7,padding:"8px 14px",fontSize:12,fontWeight:700,cursor:imageUploading?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:6}}>
+                    {imageUploading?<><Spin size={12}/>מעלה...</>:"📤 העלה מהמחשב"}
+                    <input type="file" accept="image/*" disabled={imageUploading} style={{display:"none"}} onChange={e=>uploadImage(e.target.files?.[0])}/>
+                  </label>
+                </div>
+              )}
+              {showImagePrompt&&(
+                <div style={{marginTop:12,display:"flex",gap:8,flexWrap:"wrap",alignItems:"flex-end"}}>
+                  <textarea value={imagePrompt} onChange={e=>setImagePrompt(e.target.value)} rows={2} placeholder={"תיאור התמונה, למשל: "+(result.title||form.topic||"")}
+                    style={{flex:1,minWidth:220,padding:"8px 11px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:13,fontFamily:"Heebo,sans-serif",resize:"vertical"}}/>
+                  <button onClick={generateImage} disabled={imageGenerating} style={{background:imageGenerating?"#94a3b8":GREEN,color:"#fff",border:"none",borderRadius:7,padding:"8px 16px",fontSize:12,fontWeight:700,cursor:imageGenerating?"not-allowed":"pointer"}}>
+                    {imageGenerating?"יוצר...":"צור"}
+                  </button>
+                  <button onClick={()=>{setShowImagePrompt(false);setImagePrompt("");}} style={{background:"#f1f5f9",color:"#64748b",border:"1px solid #e2e8f0",borderRadius:7,padding:"8px 13px",fontSize:12,fontWeight:600,cursor:"pointer"}}>ביטול</button>
+                </div>
+              )}
+              {imageError&&<div style={{marginTop:10,background:"#fef2f2",border:"1px solid #fecaca",borderRadius:7,padding:"7px 11px",fontSize:12,color:RED}}>{imageError}</div>}
+            </div>
+
             <div style={{display:"flex",gap:3,background:"#f1f5f9",borderRadius:8,padding:3,marginBottom:18,width:"fit-content"}}>
               {tabs.map(t=><button key={t.key} onClick={()=>setTab(t.key)} style={{padding:"6px 13px",borderRadius:6,border:"none",fontFamily:"Heebo,sans-serif",fontSize:12,fontWeight:600,cursor:"pointer",background:tab===t.key?ACCENT:"transparent",color:tab===t.key?"#fff":"#64748b"}}>{t.label}</button>)}
             </div>
@@ -1872,18 +1808,28 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
 }
 
 // ── ARTICLES LIBRARY ──────────────────────────────────────────────────────────
+// Both suggested briefs and finished articles live here (not on the client
+// card) — "מוצעים" are ideas without a full article yet, "מאושרים" are written.
 function ArticlesLibrary({activeClientId,onWriteArticle}){
   const clients=getActiveClients(activeClientId);
+  const [view,setView]=useState("suggested");
   const [preview,setPreview]=useState(null);
+  const [versionsModal,setVersionsModal]=useState(null);
+  const [reverting,setReverting]=useState(false);
+  const [customDir,setCustomDir]=useState("");
+  const [addingCustom,setAddingCustom]=useState(false);
+  const [genBriefId,setGenBriefId]=useState(null);
   const [,setTick]=useState(0);
   const refresh=()=>setTick(t=>t+1);
-  const rows=[];
+
+  const all=[];
   clients.forEach(c=>{
-    (c.articles||[]).forEach(a=>{
-      if(!hasFullArticle(a))return;
-      rows.push({clientId:c.id,clientName:c.name,article:a});
-    });
+    (c.articles||[]).forEach(a=>all.push({clientId:c.id,clientName:c.name,article:a}));
   });
+  const suggestedCount=all.filter(r=>!hasFullArticle(r.article)).length;
+  const approvedCount=all.length-suggestedCount;
+
+  const rows=all.filter(r=>view==="suggested"?!hasFullArticle(r.article):hasFullArticle(r.article));
   rows.sort((a,b)=>{
     const da=a.article.draftContent?.generatedAt||a.article.publishedAt||a.article.scheduledDate||"";
     const db=b.article.draftContent?.generatedAt||b.article.publishedAt||b.article.scheduledDate||"";
@@ -1897,48 +1843,196 @@ function ArticlesLibrary({activeClientId,onWriteArticle}){
     refresh();
   };
 
+  const saveNotes=(clientId,articleId,notes)=>{
+    DB.updateArticle(clientId,articleId,{notes});
+    refresh();
+  };
+
+  const schedule=(clientId,articleId,date)=>{
+    DB.updateArticle(clientId,articleId,{scheduledDate:date||null,status:date?"scheduled":"draft"});
+    refresh();
+  };
+
+  const addCustomArticle=async()=>{
+    if(!customDir.trim()||!activeClientId)return;
+    setAddingCustom(true);
+    try{
+      const c=DB.getById(activeClientId);
+      const prompt=
+        "Create an SEO article brief based on this custom direction.\n\n"+
+        "Custom direction: "+customDir+"\n"+
+        "Industry: "+c.industry+"\nLocation: "+(c.location||"ישראל")+"\nBusiness: "+c.name+"\nKeywords: "+(c.mainKeywords||[]).join(", ")+"\n"+
+        ((c.focusedKeywords||[]).length>0?"Focused keywords to integrate: "+c.focusedKeywords.join(", ")+"\n":"")+
+        styleGuideBlock(c)+clientContextBlock(c)+"\n"+
+        'Return ONLY valid JSON: {"title":"...","keywords":"...","type":"informational","brief":{"briefTitle":"...","angle":"...","outline":["...","...","..."],"primaryKeyword":"...","whyThisArticle":"..."}}\n'+
+        "Keep outline to 3 short items. Write values in the client's language. NEVER use double-quote inside string values.";
+      const txt=await callClaude(prompt,1500);
+      const data=parseJSON(txt);
+      DB.addArticle(activeClientId,{
+        id:uid(), title:data.title||customDir, keywords:data.keywords||"",
+        type:data.type||"informational", reason:"מאמר מותאם אישית", priority:"high",
+        status:"briefed", source:"custom", brief:data.brief||null, notes:"",
+        draftContent:null, scheduledDate:null, publishedAt:null, slug:"",
+      });
+      setCustomDir("");
+    }catch(e){alert("שגיאה: "+e.message);}
+    setAddingCustom(false);
+    refresh();
+  };
+
+  const regenerateBrief=async(clientId,article)=>{
+    setGenBriefId(article.id);
+    try{
+      const c=DB.getById(clientId);
+      const prompt=
+        "Create an SEO article brief.\n\n"+
+        "Topic: "+article.title+"\nKeywords: "+(article.keywords||"")+
+        "\nIndustry: "+(c.industry||"")+"\nLocation: "+(c.location||"")+
+        "\nArticle type: "+(article.type||"informational")+
+        notesBlock(article.notes)+
+        ((c.focusedKeywords||[]).length>0?"\nFocused keywords: "+c.focusedKeywords.join(", ")+"\n":"")+
+        styleGuideBlock(c)+clientContextBlock(c)+
+        "\nReturn ONLY valid JSON: {\"briefTitle\":\"...\",\"angle\":\"...\",\"outline\":[\"...\",\"...\",\"...\"],\"primaryKeyword\":\"...\",\"whyThisArticle\":\"...\"}\n"+
+        "Keep outline to 3 short items. Write in the client's language. NEVER use double-quote inside string values.";
+      const txt=await callClaude(prompt,1500);
+      DB.updateArticle(clientId,article.id,{brief:parseJSON(txt),status:"briefed"});
+      refresh();
+    }catch(e){alert("שגיאה: "+e.message);}
+    setGenBriefId(null);
+  };
+
+  const revertVersion=async(clientId,article,version)=>{
+    const c=DB.getById(clientId);
+    if(!getPublishTarget(c)){alert("הגדר חיבור לאתר בהגדרות הלקוח");return;}
+    if(!confirmPublish(c,version.title||article.title))return;
+    setReverting(true);
+    try{
+      const now=new Date().toISOString();
+      await pushToWorker(c,{title:version.title,metaTitle:version.metaTitle,metaDescription:version.metaDescription,content:version.content,keywords:version.keywords,slug:version.slug,publishedAt:now,featuredImage:version.featuredImage||null});
+      const remaining=(article.versions||[]).filter(v=>v.version!==version.version);
+      const archived={...article.publishedContent,publishedAt:article.publishedAt,version:(article.versions?.length||0)+1};
+      DB.updateArticle(clientId,article.id,{
+        publishedAt:now, slug:version.slug,
+        publishedContent:{title:version.title,metaTitle:version.metaTitle,metaDescription:version.metaDescription,content:version.content,keywords:version.keywords,slug:version.slug,featuredImage:version.featuredImage||null},
+        versions:[...remaining,archived],
+      });
+      setVersionsModal(null);
+      refresh();
+    }catch(e){alert("שגיאה בשחזור: "+e.message);}
+    setReverting(false);
+  };
+
+  const TabBtn=({k,label,count})=>(
+    <button onClick={()=>setView(k)} style={{
+      background:view===k?ACCENT:"#fff",color:view===k?"#fff":"#64748b",
+      border:"1px solid "+(view===k?ACCENT:"#e2e8f0"),borderRadius:9,padding:"9px 18px",
+      fontSize:13,fontWeight:700,cursor:"pointer",display:"flex",alignItems:"center",gap:7,
+    }}>
+      {label}
+      <span style={{background:view===k?"#ffffff25":"#f1f5f9",color:view===k?"#fff":"#94a3b8",borderRadius:20,padding:"1px 8px",fontSize:11,fontWeight:800}}>{count}</span>
+    </button>
+  );
+
   return(
     <div style={{flex:1,overflowY:"auto",padding:"28px 32px",background:"#f8fafc"}}>
       <div style={{maxWidth:960,margin:"0 auto"}}>
         <div style={{fontSize:20,fontWeight:800,color:ACCENT,marginBottom:6}}>מאמרים</div>
-        <div style={{fontSize:13,color:"#64748b",marginBottom:18,lineHeight:1.6}}>
-          כל המאמרים המלאים שנשמרו במערכת — גם טיוטות שעדיין לא תוזמנו ללוח הפרסום.
+        <div style={{fontSize:13,color:"#64748b",marginBottom:16,lineHeight:1.6}}>
+          {view==="suggested"
+            ?"רעיונות ותקצירים שהסוכן הציע — עדיין לא נכתב מהם מאמר מלא."
+            :"מאמרים מלאים שנכתבו ואושרו — טיוטות, מתוזמנים ומפורסמים."}
           {activeClientId?" · מסונן לפי: "+(DB.getById(activeClientId)?.name||""):""}
         </div>
+
+        <div style={{display:"flex",gap:10,marginBottom:18,flexWrap:"wrap"}}>
+          <TabBtn k="suggested" label="💡 מאמרים מוצעים" count={suggestedCount}/>
+          <TabBtn k="approved" label="✅ מאמרים מאושרים" count={approvedCount}/>
+        </div>
+
+        {view==="suggested"&&(
+          <div style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"16px 20px",marginBottom:18}}>
+            <div style={{fontSize:12,fontWeight:700,color:"#94a3b8",letterSpacing:1.5,marginBottom:10,textTransform:"uppercase"}}>הוסף מאמר מותאם אישית</div>
+            {activeClientId?(
+              <>
+                <Field name="dir" value={customDir} onChange={e=>setCustomDir(e.target.value)}
+                  placeholder="לדוגמה: רוצה מאמר על יתרונות מצלמות IP לעסקים קטנים באזור הצפון..."
+                  multiline rows={2}/>
+                <button onClick={addCustomArticle} disabled={addingCustom||!customDir.trim()}
+                  style={{background:addingCustom?"#94a3b8":ACCENT,color:"#fff",border:"none",borderRadius:8,padding:"9px 18px",fontSize:13,fontWeight:700,cursor:addingCustom?"not-allowed":"pointer"}}>
+                  {addingCustom?<span style={{display:"flex",alignItems:"center",gap:6}}><Spin color="#fff" size={13}/>יוצר...</span>:"+ צור תקציר"}
+                </button>
+              </>
+            ):(
+              <div style={{fontSize:12,color:"#94a3b8"}}>בחר לקוח בראש המסך כדי להוסיף מאמר מותאם אישית</div>
+            )}
+          </div>
+        )}
+
         {rows.length===0?(
-          <div style={{textAlign:"center",padding:"60px 0",color:"#94a3b8",fontSize:13}}>אין מאמרים מלאים עדיין — צור מאמר במסך הכתיבה</div>
+          <div style={{textAlign:"center",padding:"60px 0",color:"#94a3b8",fontSize:13}}>
+            {view==="suggested"?"אין מאמרים מוצעים — סרוק אתר או הוסף מאמר מותאם אישית":"אין מאמרים מאושרים עדיין — כתוב מאמר מלא ממאמר מוצע או ממסך הכתיבה"}
+          </div>
         ):(
           <div style={{display:"flex",flexDirection:"column",gap:10}}>
             {rows.map(({clientId,clientName,article:a})=>(
               <div key={clientId+"-"+a.id} style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"14px 18px"}}>
                 <div style={{display:"flex",justifyContent:"space-between",gap:12,flexWrap:"wrap",alignItems:"flex-start"}}>
-                  <div style={{flex:1}}>
+                  <div style={{flex:1,minWidth:220}}>
                     <div style={{fontSize:15,fontWeight:800,color:ACCENT,marginBottom:4}}>{a.draftContent?.title||a.publishedContent?.title||a.title}</div>
                     <div style={{fontSize:12,color:"#64748b",marginBottom:8}}>{clientName}{a.keywords?" · "+a.keywords:""}</div>
                     <div style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center"}}>
                       <StatusBadge status={a.status}/>
+                      {a.source==="custom"&&<span style={{background:"#fdf4ff",color:PURPLE,border:`1px solid ${PURPLE}35`,borderRadius:20,padding:"2px 9px",fontSize:10,fontWeight:700}}>מותאם</span>}
                       {a.scheduledDate&&<span style={{fontSize:12,color:PURPLE,fontWeight:600}}>📅 {formatDateTime(a.scheduledDate)}</span>}
-                      {a.draftContent?.generatedAt&&<span style={{fontSize:11,color:"#94a3b8"}}>נשמר {formatDateTime(a.draftContent.generatedAt)}</span>}
+                      {a.publishedAt&&<span style={{fontSize:12,color:GREEN,fontWeight:600}}>✓ פורסם {formatDateTime(a.publishedAt)}</span>}
+                      {a.draftContent?.generatedAt&&!a.publishedAt&&<span style={{fontSize:11,color:"#94a3b8"}}>נשמר {formatDateTime(a.draftContent.generatedAt)}</span>}
                     </div>
                   </div>
                   <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-                    <button onClick={()=>setPreview({clientId,article:a})} style={{background:"#f1f5f9",border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>📄 צפה</button>
-                    <button onClick={()=>onWriteArticle(clientId,a.id)} style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>✏ ערוך</button>
-                    {a.status!=="published"&&(
-                      <input type="datetime-local" value={toDatetimeLocal(a.scheduledDate)} onChange={e=>{
-                        const v=e.target.value;
-                        DB.updateArticle(clientId,a.id,{scheduledDate:v||null,status:v?"scheduled":"draft"});
-                        refresh();
-                      }} style={{padding:"5px 9px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:12,direction:"ltr"}} title="תזמן ללוח פרסום"/>
+                    {hasFullArticle(a)&&(
+                      <button onClick={()=>setPreview({clientId,article:a})} style={{background:"#f1f5f9",border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>📄 צפה</button>
+                    )}
+                    {(a.versions||[]).length>0&&a.status==="published"&&(
+                      <button onClick={()=>setVersionsModal({clientId,article:a})} style={{background:"#f1f5f9",color:"#64748b",border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>🕐 היסטוריה ({a.versions.length})</button>
+                    )}
+                    <button onClick={()=>onWriteArticle(clientId,a.id)} style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+                      {hasFullArticle(a)?"✏ ערוך":"✦ כתוב מאמר מלא"}
+                    </button>
+                    {a.status!=="published"&&hasFullArticle(a)&&(
+                      <input type="datetime-local" value={toDatetimeLocal(a.scheduledDate)} onChange={e=>schedule(clientId,a.id,e.target.value)}
+                        style={{padding:"5px 9px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:12,direction:"ltr"}} title="תזמן ללוח פרסום"/>
                     )}
                     <button onClick={()=>remove(clientId,a.id)} style={{background:"#fef2f2",color:RED,border:"1px solid #fecaca",borderRadius:7,padding:"7px 10px",fontSize:12,fontWeight:700,cursor:"pointer"}}>🗑</button>
                   </div>
                 </div>
+
+                {a.reason&&!a.brief&&<div style={{marginTop:8,fontSize:12,color:"#64748b",lineHeight:1.6}}>{a.reason}</div>}
+                {a.brief&&(
+                  <div style={{marginTop:10,background:"#f8fafc",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#64748b"}}>
+                    <div style={{fontWeight:700,color:ACCENT,marginBottom:4}}>{a.brief.angle||a.brief.briefTitle}</div>
+                    {(a.brief.outline||[]).map((p,i)=><div key={i}>• {p}</div>)}
+                  </div>
+                )}
+                {a.status!=="published"&&(
+                  <div style={{marginTop:10}}>
+                    <div style={{fontSize:10,fontWeight:700,color:"#94a3b8",letterSpacing:1,marginBottom:5,textTransform:"uppercase"}}>הערות / תיקונים</div>
+                    <textarea value={a.notes||""} onChange={e=>saveNotes(clientId,a.id,e.target.value)}
+                      placeholder="לדוגמה: שנה 2025 ל-2026, הדגש דגם 1000, אל תזכיר מתחרים..."
+                      rows={2} style={{width:"100%",padding:"8px 11px",border:"1.5px solid #e2e8f0",borderRadius:8,fontSize:12,resize:"vertical",outline:"none",boxSizing:"border-box",direction:"rtl",background:a.notes?"#fffbeb":"#fff"}}/>
+                    {a.notes?.trim()&&!hasFullArticle(a)&&(
+                      <button onClick={()=>regenerateBrief(clientId,a)} disabled={genBriefId===a.id}
+                        style={{marginTop:6,background:genBriefId===a.id?"#94a3b8":AMBER,color:"#fff",border:"none",borderRadius:7,padding:"6px 12px",fontSize:11,fontWeight:700,cursor:genBriefId===a.id?"not-allowed":"pointer"}}>
+                        {genBriefId===a.id?<span style={{display:"flex",alignItems:"center",gap:5}}><Spin color="#fff" size={11}/>מעדכן...</span>:"↻ עדכן תקציר לפי הערות"}
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
             ))}
           </div>
         )}
       </div>
+
       {preview&&(
         <div style={{position:"fixed",inset:0,background:"#0f172a90",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
           <div style={{background:"#fff",borderRadius:16,padding:"26px 28px",maxWidth:720,width:"100%",maxHeight:"85vh",overflowY:"auto",direction:"rtl"}}>
@@ -1950,6 +2044,36 @@ function ArticlesLibrary({activeClientId,onWriteArticle}){
               </div>
             </div>
             <ArticleView text={articleBody(preview.article)}/>
+          </div>
+        </div>
+      )}
+
+      {versionsModal&&(
+        <div style={{position:"fixed",inset:0,background:"#0f172a90",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div style={{background:"#fff",borderRadius:16,padding:"26px 28px",maxWidth:600,width:"100%",maxHeight:"80vh",overflowY:"auto",direction:"rtl"}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+              <div style={{fontSize:16,fontWeight:800,color:ACCENT}}>🕐 היסטוריית גרסאות</div>
+              <button onClick={()=>setVersionsModal(null)} style={{background:"#f1f5f9",border:"none",borderRadius:7,padding:"6px 12px",fontSize:12,fontWeight:700,cursor:"pointer",color:"#64748b"}}>✕ סגור</button>
+            </div>
+            <div style={{background:"#f0fdf4",border:"1px solid #bbf7d0",borderRadius:9,padding:"10px 14px",marginBottom:14,fontSize:12,color:"#166534"}}>
+              גרסה נוכחית: {versionsModal.article.publishedContent?.title||versionsModal.article.title} · פורסם {formatDateTime(versionsModal.article.publishedAt)}
+            </div>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              {[...(versionsModal.article.versions||[])].sort((a,b)=>b.version-a.version).map(v=>(
+                <div key={v.version} style={{border:"1px solid #e2e8f0",borderRadius:10,padding:"12px 16px"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+                    <div>
+                      <div style={{fontSize:13,fontWeight:700,color:ACCENT}}>{v.title}</div>
+                      <div style={{fontSize:11,color:"#94a3b8",marginTop:2}}>פורסם {formatDateTime(v.publishedAt)}</div>
+                    </div>
+                    <button onClick={()=>revertVersion(versionsModal.clientId,versionsModal.article,v)} disabled={reverting}
+                      style={{background:reverting?"#94a3b8":AMBER,color:"#fff",border:"none",borderRadius:7,padding:"7px 14px",fontSize:12,fontWeight:700,cursor:reverting?"not-allowed":"pointer",flexShrink:0}}>
+                      ↩ שחזר גרסה זו
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         </div>
       )}
@@ -2086,7 +2210,7 @@ export default function SEOAgent(){
 
   const scopedClients=getActiveClients(activeClientId);
   const totalScheduled=scopedClients.reduce((s,c)=>s+(c.articles||[]).filter(a=>a.status==="scheduled"&&hasFullArticle(a)).length,0);
-  const totalDrafts=scopedClients.reduce((s,c)=>s+(c.articles||[]).filter(a=>hasFullArticle(a)).length,0);
+  const totalDrafts=scopedClients.reduce((s,c)=>s+(c.articles||[]).length,0);
   const activeClient=activeClientId?DB.getById(activeClientId):null;
   const allClients=DB.get();
 
@@ -2134,14 +2258,17 @@ export default function SEOAgent(){
               {key:"calendar",label:"📅 לוח פרסום", badge:totalScheduled},
             ].map(n=><NavTab key={n.key} label={n.label} active={page===n.key} onClick={()=>{
               if(n.key==="clients"&&activeClientId)setOpenClientId(activeClientId);
+              // Entering "כתיבה" from the nav always starts a fresh article —
+              // editing an existing one happens via the ✏ buttons (goWrite).
+              if(n.key==="write")setWriteProps(null);
               setPage(n.key);
             }} badge={n.badge}/>)}
           </div>
         </div>
         <div style={{display:"flex",flex:1,overflow:"hidden"}}>
           {page==="scan"    && <SiteScanner onClientSaved={id=>{setOpenClientId(id);setActiveClientId(id);setPage("clients");}}/>}
-          {page==="clients" && <ClientManager onWriteArticle={goWrite} initialOpenId={openClientId} onSelectClient={id=>setActiveClientId(id)}/>}
-          {page==="write"   && <ContentWriter clientId={writeProps?.clientId} articleId={writeProps?.articleId} activeClientId={activeClientId} onBack={()=>goClients(writeProps?.clientId||activeClientId)} onSaved={()=>refreshNav()}/>}
+          {page==="clients" && <ClientManager initialOpenId={openClientId} onSelectClient={id=>setActiveClientId(id)}/>}
+          {page==="write"   && <ContentWriter key={writeProps?.articleId||"new"} clientId={writeProps?.clientId} articleId={writeProps?.articleId} activeClientId={activeClientId} onBack={()=>goClients(writeProps?.clientId||activeClientId)} onSaved={()=>refreshNav()}/>}
           {page==="articles"&& <ArticlesLibrary activeClientId={activeClientId} onWriteArticle={goWrite}/>}
           {page==="calendar"&& <Calendar activeClientId={activeClientId} onWriteArticle={goWrite}/>}
         </div>
