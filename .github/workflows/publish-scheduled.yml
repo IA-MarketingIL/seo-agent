@@ -1,0 +1,13 @@
+name: Daily scheduled publish
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish due articles
+        run: |
+          curl -sf -X POST "https://https://seo-agent-3jx.pages.dev//api/publish-scheduled" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}"
