@@ -337,6 +337,47 @@ const hasFullArticle=(a)=>!!(a?.draftContent?.article||a?.publishedContent?.cont
 const uid = () => Math.random().toString(36).slice(2,10);
 const getActiveClients=(activeClientId)=>activeClientId?DB.get().filter(c=>c.id===activeClientId):DB.get();
 
+// ── CLIENT REVIEW LINKS ───────────────────────────────────────────────────────
+// A review stores a snapshot of the article in its own table, so the client
+// approves exactly what they were sent and their answer is never overwritten
+// by the browser's next full-row sync of seo_clients.
+const reviewToken=()=>Array.from(crypto.getRandomValues(new Uint8Array(18)),b=>b.toString(16).padStart(2,"0")).join("");
+
+const createReviewLink=async({clientId,clientName,articleId,content})=>{
+  if(!supabase)throw new Error("קישור לאישור דורש חיבור ל-Supabase");
+  const token=reviewToken();
+  const {error}=await supabase.from("article_reviews").insert({
+    token, client_id:clientId, article_id:articleId, client_name:clientName||"",
+    title:content.title||"", meta_description:content.metaDescription||"",
+    content:content.article||content.content||"", featured_image:content.featuredImage||null,
+  });
+  if(error)throw new Error(error.message);
+  return window.location.origin+"/review/"+token;
+};
+
+// Latest review per article — what the client last said about it.
+const fetchLatestReviews=async()=>{
+  if(!supabase)return {};
+  const {data,error}=await supabase.from("article_reviews")
+    .select("token,article_id,status,comment,created_at,responded_at")
+    .order("created_at",{ascending:false});
+  if(error||!data)return {};
+  const byArticle={};
+  for(const r of data)if(!byArticle[r.article_id])byArticle[r.article_id]=r;
+  return byArticle;
+};
+
+const REVIEW_BADGE={
+  pending:{label:"⏳ ממתין לאישור הלקוח",color:AMBER},
+  approved:{label:"✅ הלקוח אישר",color:GREEN},
+  changes:{label:"✏ הלקוח ביקש שינויים",color:RED},
+};
+function ReviewBadge({review}){
+  if(!review)return null;
+  const b=REVIEW_BADGE[review.status]||REVIEW_BADGE.pending;
+  return <span style={{background:b.color+"14",color:b.color,border:`1px solid ${b.color}35`,borderRadius:20,padding:"2px 10px",fontSize:11,fontWeight:700}}>{b.label}</span>;
+}
+
 // ── FULL SITE SCAN PIPELINE (shared by SiteScanner + client-card rescan) ──────
 // Measured crawl data handed to the model as facts, so the audit describes the
 // real site instead of a plausible-sounding guess.
@@ -1282,6 +1323,9 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
   const [imageGenerating,setImageGenerating]=useState(false);
   const [imageUploading,setImageUploading]=useState(false);
   const [imageError,setImageError]=useState("");
+  const [reviewLink,setReviewLink]=useState("");
+  const [reviewBusy,setReviewBusy]=useState(false);
+  const [reviewError,setReviewError]=useState("");
 
   const effectiveClientId=resolvedClientId||clientId;
 
@@ -1428,6 +1472,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
     setRevisionNotes({content:"",keywords:"",structure:""});
     setSchedDate("");setPublished(false);setError(null);setTab("article");
     setImagePrompt("");setShowImagePrompt(false);setImageError("");
+    setReviewLink("");setReviewError("");
   };
 
   const saveDraft=()=>{
@@ -1461,15 +1506,21 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
     }catch{}
   };
 
-  const generateImage=async()=>{
+  // With no custom description the server builds the prompt from the article
+  // itself, so one click gives an image that matches the content.
+  const generateImage=async(customPrompt)=>{
     if(!result?.slug){setImageError("צור מאמר קודם");return;}
-    if(!imagePrompt.trim()){setImageError("נא לתאר את התמונה הרצויה");return;}
     setImageGenerating(true);setImageError("");
     try{
       const res=await fetch("/api/generate-image",{
         method:"POST",
         headers:{"Content-Type":"application/json"},
-        body:JSON.stringify({prompt:imagePrompt.trim(),domain:client?.domain||"",workerUrl:client?.workerUrl||"",token:client?.token||"",slug:result.slug}),
+        body:JSON.stringify({
+          clientId:effectiveClientId||"", slug:result.slug,
+          title:result.title||form.topic, metaDescription:result.metaDescription||"",
+          industry:client?.industry||"", businessName:client?.name||"",
+          prompt:(customPrompt||"").trim()||undefined,
+        }),
       });
       const d=await res.json();
       if(!res.ok||!d.url)throw new Error(d.error||"יצירת התמונה נכשלה");
@@ -1484,14 +1535,9 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
     if(!file)return;
     setImageUploading(true);setImageError("");
     try{
-      const res=await fetch("/api/upload-image?slug="+encodeURIComponent(result.slug),{
+      const res=await fetch("/api/upload-image?slug="+encodeURIComponent(result.slug)+"&clientId="+encodeURIComponent(effectiveClientId||""),{
         method:"POST",
-        headers:{
-          "Content-Type":file.type||"application/octet-stream",
-          "X-Client-Domain":client?.domain||"",
-          "X-Worker-Url":client?.workerUrl||"",
-          "X-Worker-Token":client?.token||"",
-        },
+        headers:{"Content-Type":file.type||"application/octet-stream"},
         body:file,
       });
       const d=await res.json();
@@ -1499,6 +1545,23 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
       saveImageUrl(d.url);
     }catch(e){setImageError(e.message);}
     setImageUploading(false);
+  };
+
+  const sendForReview=async()=>{
+    if(!result)return;
+    setReviewBusy(true);setReviewError("");
+    try{
+      // Save first so the review points at a real article in the library.
+      const id=persistArticle(result,{
+        status:article?.status==="published"?"published":(schedDate?"scheduled":"draft"),
+        scheduledDate:schedDate||null,
+      });
+      const link=await createReviewLink({clientId:effectiveClientId,clientName:client?.name,articleId:id,content:result});
+      setReviewLink(link);
+      try{await navigator.clipboard.writeText(link);}catch{}
+      onSaved?.();
+    }catch(e){setReviewError(e.message);}
+    setReviewBusy(false);
   };
 
   const publishArticle=async()=>{
@@ -1701,7 +1764,9 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
                 <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
                   <img src={result.featuredImage} alt="" style={{width:120,height:80,objectFit:"cover",borderRadius:8,border:"1px solid #e2e8f0"}}/>
                   <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
-                    <button onClick={()=>setShowImagePrompt(true)} style={{background:"#f1f5f9",color:ACCENT,border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 13px",fontSize:12,fontWeight:700,cursor:"pointer"}}>✨ צור תמונה חדשה</button>
+                    <button onClick={()=>generateImage()} disabled={imageGenerating} style={{background:"#f1f5f9",color:ACCENT,border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 13px",fontSize:12,fontWeight:700,cursor:imageGenerating?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:6}}>
+                      {imageGenerating?<><Spin size={12}/>יוצר...</>:"✨ צור תמונה אחרת"}
+                    </button>
                     <label style={{background:"#f1f5f9",color:ACCENT,border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 13px",fontSize:12,fontWeight:700,cursor:"pointer"}}>
                       📤 החלף מהמחשב
                       <input type="file" accept="image/*" style={{display:"none"}} onChange={e=>uploadImage(e.target.files?.[0])}/>
@@ -1711,8 +1776,8 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
                 </div>
               ):(
                 <div style={{display:"flex",gap:8,flexWrap:"wrap",alignItems:"center"}}>
-                  <button onClick={()=>setShowImagePrompt(true)} disabled={imageGenerating} style={{background:imageGenerating?"#94a3b8":ACCENT,color:"#fff",border:"none",borderRadius:7,padding:"8px 14px",fontSize:12,fontWeight:700,cursor:imageGenerating?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:6}}>
-                    {imageGenerating?<><Spin color="#fff" size={12}/>יוצר תמונה...</>:"✨ צור עם AI"}
+                  <button onClick={()=>generateImage()} disabled={imageGenerating} style={{background:imageGenerating?"#94a3b8":ACCENT,color:"#fff",border:"none",borderRadius:7,padding:"8px 14px",fontSize:12,fontWeight:700,cursor:imageGenerating?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:6}}>
+                    {imageGenerating?<><Spin color="#fff" size={12}/>יוצר תמונה לפי המאמר...</>:"✨ צור תמונה לפי המאמר"}
                   </button>
                   <label style={{background:imageUploading?"#94a3b8":"#f1f5f9",color:imageUploading?"#fff":ACCENT,border:"1px solid #e2e8f0",borderRadius:7,padding:"8px 14px",fontSize:12,fontWeight:700,cursor:imageUploading?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:6}}>
                     {imageUploading?<><Spin size={12}/>מעלה...</>:"📤 העלה מהמחשב"}
@@ -1720,17 +1785,44 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
                   </label>
                 </div>
               )}
+              {!showImagePrompt&&(
+                <button onClick={()=>setShowImagePrompt(true)} style={{marginTop:10,background:"transparent",border:"none",padding:0,color:"#64748b",fontSize:12,textDecoration:"underline",cursor:"pointer"}}>
+                  רוצה תמונה מסוימת? תאר אותה בעצמך
+                </button>
+              )}
               {showImagePrompt&&(
                 <div style={{marginTop:12,display:"flex",gap:8,flexWrap:"wrap",alignItems:"flex-end"}}>
-                  <textarea value={imagePrompt} onChange={e=>setImagePrompt(e.target.value)} rows={2} placeholder={"תיאור התמונה, למשל: "+(result.title||form.topic||"")}
+                  <textarea value={imagePrompt} onChange={e=>setImagePrompt(e.target.value)} rows={2} placeholder="למשל: טרקטורון Can-Am בשביל עפר בשקיעה, צילום מקצועי"
                     style={{flex:1,minWidth:220,padding:"8px 11px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:13,fontFamily:"Heebo,sans-serif",resize:"vertical"}}/>
-                  <button onClick={generateImage} disabled={imageGenerating} style={{background:imageGenerating?"#94a3b8":GREEN,color:"#fff",border:"none",borderRadius:7,padding:"8px 16px",fontSize:12,fontWeight:700,cursor:imageGenerating?"not-allowed":"pointer"}}>
+                  <button onClick={()=>imagePrompt.trim()?generateImage(imagePrompt):setImageError("נא לתאר את התמונה הרצויה")} disabled={imageGenerating} style={{background:imageGenerating?"#94a3b8":GREEN,color:"#fff",border:"none",borderRadius:7,padding:"8px 16px",fontSize:12,fontWeight:700,cursor:imageGenerating?"not-allowed":"pointer"}}>
                     {imageGenerating?"יוצר...":"צור"}
                   </button>
                   <button onClick={()=>{setShowImagePrompt(false);setImagePrompt("");}} style={{background:"#f1f5f9",color:"#64748b",border:"1px solid #e2e8f0",borderRadius:7,padding:"8px 13px",fontSize:12,fontWeight:600,cursor:"pointer"}}>ביטול</button>
                 </div>
               )}
               {imageError&&<div style={{marginTop:10,background:"#fef2f2",border:"1px solid #fecaca",borderRadius:7,padding:"7px 11px",fontSize:12,color:RED}}>{imageError}</div>}
+            </div>
+
+            {/* ── CLIENT REVIEW LINK ── */}
+            <div style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:10,padding:"14px 16px",marginBottom:16}}>
+              <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",letterSpacing:1,marginBottom:8,textTransform:"uppercase"}}>🔗 אישור לקוח</div>
+              <div style={{fontSize:12,color:"#64748b",marginBottom:10,lineHeight:1.6}}>
+                קישור לתצוגה מקדימה שאפשר לשלוח ללקוח — הוא יראה את המאמר והתמונה, ויוכל לאשר או לבקש שינויים. התשובה תופיע בעמוד המאמרים.
+              </div>
+              <button onClick={sendForReview} disabled={reviewBusy} style={{background:reviewBusy?"#94a3b8":BLUE,color:"#fff",border:"none",borderRadius:7,padding:"8px 14px",fontSize:12,fontWeight:700,cursor:reviewBusy?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:6}}>
+                {reviewBusy?<><Spin color="#fff" size={12}/>יוצר קישור...</>:reviewLink?"🔗 צור קישור חדש (לגרסה הנוכחית)":"🔗 צור קישור לאישור לקוח"}
+              </button>
+              {reviewLink&&(
+                <div style={{marginTop:10,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                  <input readOnly value={reviewLink} onFocus={e=>e.target.select()}
+                    style={{flex:1,minWidth:240,padding:"7px 10px",border:"1.5px solid #bbf7d0",background:"#f0fdf4",borderRadius:7,fontSize:12,direction:"ltr"}}/>
+                  <button onClick={()=>navigator.clipboard.writeText(reviewLink)} style={{background:"#f1f5f9",border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>📋 העתק</button>
+                  <a href={"https://wa.me/?text="+encodeURIComponent("היי, מצרף טיוטת מאמר לאישורך: "+reviewLink)} target="_blank" rel="noopener noreferrer"
+                    style={{background:"#16a34a",color:"#fff",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,textDecoration:"none"}}>שלח בוואטסאפ</a>
+                  <div style={{width:"100%",fontSize:11,color:GREEN}}>✓ הקישור הועתק. שינויים שתעשה במאמר מעכשיו לא יופיעו בו — צור קישור חדש אחרי עריכה.</div>
+                </div>
+              )}
+              {reviewError&&<div style={{marginTop:10,background:"#fef2f2",border:"1px solid #fecaca",borderRadius:7,padding:"7px 11px",fontSize:12,color:RED}}>{reviewError}</div>}
             </div>
 
             <div style={{display:"flex",gap:3,background:"#f1f5f9",borderRadius:8,padding:3,marginBottom:18,width:"fit-content"}}>
@@ -1819,8 +1911,22 @@ function ArticlesLibrary({activeClientId,onWriteArticle}){
   const [customDir,setCustomDir]=useState("");
   const [addingCustom,setAddingCustom]=useState(false);
   const [genBriefId,setGenBriefId]=useState(null);
+  const [reviews,setReviews]=useState({});
+  const [linkFor,setLinkFor]=useState(null); // {articleId, url}
   const [,setTick]=useState(0);
   const refresh=()=>setTick(t=>t+1);
+
+  useEffect(()=>{fetchLatestReviews().then(setReviews);},[]);
+
+  const sendForReview=async(clientId,clientName,a)=>{
+    const content=a.draftContent||{...a.publishedContent,article:a.publishedContent?.content};
+    try{
+      const url=await createReviewLink({clientId,clientName,articleId:a.id,content});
+      try{await navigator.clipboard.writeText(url);}catch{}
+      setLinkFor({articleId:a.id,url});
+      setReviews(await fetchLatestReviews());
+    }catch(e){alert("שגיאה: "+e.message);}
+  };
 
   const all=[];
   clients.forEach(c=>{
@@ -1986,7 +2092,13 @@ function ArticlesLibrary({activeClientId,onWriteArticle}){
                       {a.scheduledDate&&<span style={{fontSize:12,color:PURPLE,fontWeight:600}}>📅 {formatDateTime(a.scheduledDate)}</span>}
                       {a.publishedAt&&<span style={{fontSize:12,color:GREEN,fontWeight:600}}>✓ פורסם {formatDateTime(a.publishedAt)}</span>}
                       {a.draftContent?.generatedAt&&!a.publishedAt&&<span style={{fontSize:11,color:"#94a3b8"}}>נשמר {formatDateTime(a.draftContent.generatedAt)}</span>}
+                      <ReviewBadge review={reviews[a.id]}/>
                     </div>
+                    {reviews[a.id]?.comment&&(
+                      <div style={{marginTop:8,background:"#fffbeb",border:"1px solid #fde68a",borderRadius:8,padding:"8px 12px",fontSize:12,color:"#92400e",lineHeight:1.6}}>
+                        <strong>הערת הלקוח:</strong> {reviews[a.id].comment}
+                      </div>
+                    )}
                   </div>
                   <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
                     {hasFullArticle(a)&&(
@@ -1998,6 +2110,9 @@ function ArticlesLibrary({activeClientId,onWriteArticle}){
                     <button onClick={()=>onWriteArticle(clientId,a.id)} style={{background:BLUE,color:"#fff",border:"none",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>
                       {hasFullArticle(a)?"✏ ערוך":"✦ כתוב מאמר מלא"}
                     </button>
+                    {hasFullArticle(a)&&a.status!=="published"&&(
+                      <button onClick={()=>sendForReview(clientId,clientName,a)} style={{background:"#eff6ff",color:BLUE,border:"1px solid #bfdbfe",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>🔗 שלח לאישור</button>
+                    )}
                     {a.status!=="published"&&hasFullArticle(a)&&(
                       <input type="datetime-local" value={toDatetimeLocal(a.scheduledDate)} onChange={e=>schedule(clientId,a.id,e.target.value)}
                         style={{padding:"5px 9px",border:"1.5px solid #e2e8f0",borderRadius:7,fontSize:12,direction:"ltr"}} title="תזמן ללוח פרסום"/>
@@ -2006,6 +2121,15 @@ function ArticlesLibrary({activeClientId,onWriteArticle}){
                   </div>
                 </div>
 
+                {linkFor?.articleId===a.id&&(
+                  <div style={{marginTop:10,display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                    <input readOnly value={linkFor.url} onFocus={e=>e.target.select()}
+                      style={{flex:1,minWidth:240,padding:"7px 10px",border:"1.5px solid #bbf7d0",background:"#f0fdf4",borderRadius:7,fontSize:12,direction:"ltr"}}/>
+                    <a href={"https://wa.me/?text="+encodeURIComponent("היי, מצרף טיוטת מאמר לאישורך: "+linkFor.url)} target="_blank" rel="noopener noreferrer"
+                      style={{background:"#16a34a",color:"#fff",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,textDecoration:"none"}}>שלח בוואטסאפ</a>
+                    <span style={{fontSize:11,color:GREEN}}>✓ הועתק</span>
+                  </div>
+                )}
                 {a.reason&&!a.brief&&<div style={{marginTop:8,fontSize:12,color:"#64748b",lineHeight:1.6}}>{a.reason}</div>}
                 {a.brief&&(
                   <div style={{marginTop:10,background:"#f8fafc",borderRadius:8,padding:"10px 14px",fontSize:12,color:"#64748b"}}>

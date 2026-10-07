@@ -1,8 +1,20 @@
 /**
  * Generates a featured image with Google Gemini and stores it via storeImage.
  * GEMINI_API_KEY lives only here (Cloudflare Pages secret) — never sent to the browser.
+ *
+ * With no explicit `prompt`, the prompt is built from the article itself so a
+ * single click produces an image that matches what the article is about.
  */
 import { storeImage } from "../_storage.js";
+
+const buildPrompt = ({ title, metaDescription, industry, businessName }) =>
+  [
+    `Professional editorial photograph to illustrate a blog article titled "${title}".`,
+    metaDescription ? `The article is about: ${metaDescription}` : "",
+    industry ? `Industry context: ${industry}${businessName ? ` (${businessName})` : ""}.` : "",
+    "Photorealistic, natural lighting, high quality, wide landscape composition.",
+    "Absolutely no text, letters, words, logos or watermarks anywhere in the image.",
+  ].filter(Boolean).join(" ");
 
 export async function onRequestPost({ request, env }) {
   let body;
@@ -12,34 +24,33 @@ export async function onRequestPost({ request, env }) {
     return json({ error: "invalid JSON" }, 400);
   }
 
-  const { prompt, domain, workerUrl, token, slug } = body;
-  if (!prompt || !slug) return json({ error: "prompt and slug are required" }, 400);
-  if (!env.GEMINI_API_KEY) return json({ error: "GEMINI_API_KEY is not configured" }, 500);
+  const { clientId, slug, title } = body;
+  if (!slug || (!body.prompt && !title)) return json({ error: "slug and a prompt or title are required" }, 400);
+  if (!env.GEMINI_API_KEY) return json({ error: "GEMINI_API_KEY לא מוגדר ב-Cloudflare" }, 500);
 
-  const genRes = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-    }
-  );
-  const genData = await genRes.json();
-  if (!genRes.ok) {
-    return json({ error: "Gemini error: " + (genData.error?.message || "unknown") }, 502);
-  }
-
-  const parts = genData.candidates?.[0]?.content?.parts || [];
-  const imgPart = parts.find((p) => p.inlineData?.data);
-  if (!imgPart) return json({ error: "Gemini did not return an image" }, 502);
-
-  const contentType = imgPart.inlineData.mimeType || "image/png";
-  const bytes = base64ToBytes(imgPart.inlineData.data);
-  const ext = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
+  const prompt = body.prompt?.trim() || buildPrompt(body);
 
   try {
-    const url = await storeImage(env, { domain, workerUrl, token, bytes, contentType, filename: slug + "." + ext });
-    return json({ ok: true, url });
+    const genRes = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": env.GEMINI_API_KEY },
+        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      }
+    );
+    const genData = await genRes.json();
+    if (!genRes.ok) {
+      return json({ error: "Gemini error: " + (genData.error?.message || "unknown") }, 502);
+    }
+
+    const parts = genData.candidates?.[0]?.content?.parts || [];
+    const imgPart = parts.find((p) => p.inlineData?.data);
+    if (!imgPart) return json({ error: "Gemini לא החזיר תמונה — נסה שוב או נסח תיאור אחר" }, 502);
+
+    const contentType = imgPart.inlineData.mimeType || "image/png";
+    const url = await storeImage(env, { clientId, slug, bytes: base64ToBytes(imgPart.inlineData.data), contentType });
+    return json({ ok: true, url, prompt });
   } catch (e) {
     return json({ error: e.message }, 502);
   }

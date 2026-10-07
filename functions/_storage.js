@@ -1,28 +1,37 @@
 /**
- * Routes an image blob to the right storage for a given client:
- * DS Motors → its own Supabase Storage; everyone else → their own
- * Cloudflare Worker's KV (via a new /seo-api/image endpoint on the
- * per-client Worker template).
+ * Stores article images in the agent's own Supabase Storage (public bucket
+ * `article-images`), for every client. The resulting public URL is just a
+ * string, so it works as DS Motors' `featured_image` and as a Worker client's
+ * `featuredImage` alike — no per-client storage setup, and nothing needed in
+ * client accounts we don't control (DS Motors' Supabase is Lovable-managed).
  */
-import { dsMotorsUploadImage } from "./_dsmotors.js";
+const BUCKET = "article-images";
 
-const isDsMotors = (domain) => (domain || "").includes("dsmotors.co.il");
-
-export async function storeImage(env, { domain, workerUrl, token, bytes, contentType, filename }) {
-  if (isDsMotors(domain)) {
-    return dsMotorsUploadImage(env, { bytes, contentType, filename });
+export async function storeImage(env, { clientId, slug, bytes, contentType }) {
+  if (!env.VITE_SUPABASE_URL || !env.VITE_SUPABASE_ANON_KEY) {
+    throw new Error("Supabase is not configured");
   }
+  const base = env.VITE_SUPABASE_URL.trim().replace(/\/$/, "");
+  const ext = contentType.includes("png") ? "png"
+    : contentType.includes("webp") ? "webp"
+    : contentType.includes("gif") ? "gif"
+    : "jpg";
+  // A fresh name per upload — replacing an image must not hit a CDN-cached copy.
+  const safe = (s) => String(s || "x").toLowerCase().replace(/[^a-z0-9-]+/g, "-").slice(0, 60);
+  const path = `${safe(clientId)}/${safe(slug)}-${Date.now()}.${ext}`;
 
-  if (!workerUrl || !token) {
-    throw new Error("חסר Worker URL או Auth Token אצל הלקוח");
-  }
-  const base = workerUrl.replace(/\/$/, "");
-  const slug = filename.replace(/\.[^.]+$/, "");
-  const res = await fetch(base + "/seo-api/image/" + encodeURIComponent(slug), {
+  const res = await fetch(`${base}/storage/v1/object/${BUCKET}/${path}`, {
     method: "POST",
-    headers: { "Content-Type": contentType || "application/octet-stream", Authorization: "Bearer " + token },
+    headers: {
+      "Content-Type": contentType || "application/octet-stream",
+      apikey: env.VITE_SUPABASE_ANON_KEY,
+      Authorization: "Bearer " + env.VITE_SUPABASE_ANON_KEY,
+    },
     body: bytes,
   });
-  if (!res.ok) throw new Error("Image upload to Worker failed: HTTP " + res.status);
-  return base + "/seo-api/image/" + encodeURIComponent(slug);
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error("Image upload failed: HTTP " + res.status + " " + detail.slice(0, 200));
+  }
+  return `${base}/storage/v1/object/public/${BUCKET}/${path}`;
 }
