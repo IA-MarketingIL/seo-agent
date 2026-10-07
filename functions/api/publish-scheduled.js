@@ -10,11 +10,24 @@ import { dsMotorsPublish } from "../_dsmotors.js";
 const isDsMotors = (domain) => (domain || "").includes("dsmotors.co.il");
 
 export async function onRequestPost({ request, env }) {
+  try {
+    return await run(request, env);
+  } catch (e) {
+    // Without this the Worker throws and Cloudflare returns an opaque 1101,
+    // which says nothing about what actually broke.
+    return json({ error: e.message || String(e) }, 500);
+  }
+}
+
+async function run(request, env) {
   if (!env.CRON_SECRET || request.headers.get("X-Cron-Secret") !== env.CRON_SECRET) {
     return json({ error: "unauthorized" }, 401);
   }
   if (!env.VITE_SUPABASE_URL || !env.VITE_SUPABASE_ANON_KEY) {
     return json({ error: "Supabase is not configured" }, 500);
+  }
+  if (!/^https?:\/\//i.test(env.VITE_SUPABASE_URL.trim())) {
+    return json({ error: "VITE_SUPABASE_URL is not a URL: " + env.VITE_SUPABASE_URL.slice(0, 20) + "..." }, 500);
   }
 
   const rows = await fetchClients(env);
@@ -89,16 +102,21 @@ async function publishOne(env, client, draft) {
   if (!res.ok) throw new Error("Worker publish failed: HTTP " + res.status);
 }
 
+const supabaseBase = (env) => env.VITE_SUPABASE_URL.trim().replace(/\/$/, "");
+
 async function fetchClients(env) {
-  const res = await fetch(env.VITE_SUPABASE_URL + "/rest/v1/seo_clients?select=id,data", {
+  const res = await fetch(supabaseBase(env) + "/rest/v1/seo_clients?select=id,data", {
     headers: { apikey: env.VITE_SUPABASE_ANON_KEY, Authorization: "Bearer " + env.VITE_SUPABASE_ANON_KEY },
   });
-  if (!res.ok) throw new Error("Failed to read seo_clients: HTTP " + res.status);
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error("Failed to read seo_clients: HTTP " + res.status + " " + detail.slice(0, 200));
+  }
   return res.json();
 }
 
 async function saveClient(env, id, data) {
-  await fetch(env.VITE_SUPABASE_URL + "/rest/v1/seo_clients?id=eq." + encodeURIComponent(id), {
+  const res = await fetch(supabaseBase(env) + "/rest/v1/seo_clients?id=eq." + encodeURIComponent(id), {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
@@ -108,6 +126,10 @@ async function saveClient(env, id, data) {
     },
     body: JSON.stringify({ data, updated_at: new Date().toISOString() }),
   });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error("Failed to save client " + id + ": HTTP " + res.status + " " + detail.slice(0, 200));
+  }
 }
 
 function json(data, status = 200) {
