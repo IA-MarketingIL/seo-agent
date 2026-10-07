@@ -9,5 +9,6 @@ jobs:
     steps:
       - name: Publish due articles
         run: |
-          curl -sf -X POST "https://https://seo-agent-3jx.pages.dev//api/publish-scheduled" \
+          curl --fail-with-body -sS -X POST \
+            "https://seo-agent-3jx.pages.dev/api/publish-scheduled" \
             -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}"
