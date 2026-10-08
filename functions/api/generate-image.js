@@ -41,7 +41,18 @@ export async function onRequestPost({ request, env }) {
     );
     const genData = await genRes.json();
     if (!genRes.ok) {
-      return json({ error: "Gemini error: " + (genData.error?.message || "unknown") }, 502);
+      const msg = genData.error?.message || "unknown";
+      // Image models have no free tier — "limit: 0" means billing isn't enabled,
+      // not that a quota ran out. Say what to do instead of dumping the raw error.
+      if (genRes.status === 429 || /quota|RESOURCE_EXHAUSTED/i.test(msg)) {
+        const noFreeTier = /limit:\s*0\b/.test(msg);
+        return json({
+          error: noFreeTier
+            ? "יצירת תמונות ב-Gemini דורשת הפעלת חיוב: aistudio.google.com/apikey ← Set up billing על הפרויקט של המפתח."
+            : "הגעת למכסת יצירת התמונות ב-Gemini — נסה שוב בעוד כמה דקות.",
+        }, 429);
+      }
+      return json({ error: "Gemini error: " + msg }, 502);
     }
 
     const parts = genData.candidates?.[0]?.content?.parts || [];
