@@ -567,6 +567,22 @@ const SCAN_STEPS=[
 ];
 
 // ── UI PRIMITIVES ─────────────────────────────────────────────────────────────
+function ImageLightbox({src,onClose}){
+  useEffect(()=>{
+    const onKey=e=>{if(e.key==="Escape")onClose();};
+    window.addEventListener("keydown",onKey);
+    return()=>window.removeEventListener("keydown",onKey);
+  },[onClose]);
+  return(
+    <div onClick={onClose} style={{position:"fixed",inset:0,background:"#0f172ae6",zIndex:2000,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:24,cursor:"zoom-out"}}>
+      <img src={src} alt="" onClick={e=>e.stopPropagation()} style={{maxWidth:"100%",maxHeight:"calc(100vh - 110px)",objectFit:"contain",borderRadius:10,boxShadow:"0 20px 60px #0008",cursor:"default"}}/>
+      <div onClick={e=>e.stopPropagation()} style={{display:"flex",gap:10,marginTop:16}}>
+        <a href={src} target="_blank" rel="noopener noreferrer" style={{background:"#fff",color:ACCENT,borderRadius:8,padding:"8px 16px",fontSize:13,fontWeight:700,textDecoration:"none"}}>↗ פתח בגודל מקורי</a>
+        <button onClick={onClose} style={{background:"#ffffff22",color:"#fff",border:"1px solid #ffffff44",borderRadius:8,padding:"8px 16px",fontSize:13,fontWeight:700,cursor:"pointer"}}>✕ סגור</button>
+      </div>
+    </div>
+  );
+}
 function Spin({size=16,color=BLUE}){
   return <div style={{width:size,height:size,border:`2px solid #e2e8f0`,borderTop:`2px solid ${color}`,borderRadius:"50%",animation:"spin .7s linear infinite",flexShrink:0}}/>;
 }
@@ -1323,6 +1339,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
   const [imageGenerating,setImageGenerating]=useState(false);
   const [imageUploading,setImageUploading]=useState(false);
   const [imageError,setImageError]=useState("");
+  const [imageZoom,setImageZoom]=useState(false);
   const [reviewLink,setReviewLink]=useState("");
   const [reviewBusy,setReviewBusy]=useState(false);
   const [reviewError,setReviewError]=useState("");
@@ -1762,7 +1779,8 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
               <div style={{fontSize:11,fontWeight:700,color:"#94a3b8",letterSpacing:1,marginBottom:10,textTransform:"uppercase"}}>🖼 תמונה ראשית</div>
               {result.featuredImage?(
                 <div style={{display:"flex",alignItems:"center",gap:14,flexWrap:"wrap"}}>
-                  <img src={result.featuredImage} alt="" style={{width:120,height:80,objectFit:"cover",borderRadius:8,border:"1px solid #e2e8f0"}}/>
+                  <img src={result.featuredImage} alt="" onClick={()=>setImageZoom(true)} title="לחץ להגדלה"
+                    style={{width:240,height:160,objectFit:"cover",borderRadius:8,border:"1px solid #e2e8f0",cursor:"zoom-in"}}/>
                   <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
                     <button onClick={()=>generateImage()} disabled={imageGenerating} style={{background:"#f1f5f9",color:ACCENT,border:"1px solid #e2e8f0",borderRadius:7,padding:"7px 13px",fontSize:12,fontWeight:700,cursor:imageGenerating?"not-allowed":"pointer",display:"flex",alignItems:"center",gap:6}}>
                       {imageGenerating?<><Spin size={12}/>יוצר...</>:"✨ צור תמונה אחרת"}
@@ -1802,6 +1820,7 @@ function ContentWriter({clientId,articleId,onBack,activeClientId,onSaved}){
               )}
               {imageError&&<div style={{marginTop:10,background:"#fef2f2",border:"1px solid #fecaca",borderRadius:7,padding:"7px 11px",fontSize:12,color:RED}}>{imageError}</div>}
             </div>
+            {imageZoom&&result.featuredImage&&<ImageLightbox src={result.featuredImage} onClose={()=>setImageZoom(false)}/>}
 
             {/* ── CLIENT REVIEW LINK ── */}
             <div style={{background:"#fff",border:"1px solid #e2e8f0",borderRadius:10,padding:"14px 16px",marginBottom:16}}>
@@ -1913,6 +1932,8 @@ function ArticlesLibrary({activeClientId,onWriteArticle}){
   const [genBriefId,setGenBriefId]=useState(null);
   const [reviews,setReviews]=useState({});
   const [linkFor,setLinkFor]=useState(null); // {articleId, url}
+  const [zoomSrc,setZoomSrc]=useState(null);
+  const imageOf=(a)=>a.draftContent?.featuredImage||a.publishedContent?.featuredImage||null;
   const [,setTick]=useState(0);
   const refresh=()=>setTick(t=>t+1);
 
@@ -2083,6 +2104,10 @@ function ArticlesLibrary({activeClientId,onWriteArticle}){
             {rows.map(({clientId,clientName,article:a})=>(
               <div key={clientId+"-"+a.id} style={{background:"#fff",borderRadius:11,border:"1px solid #e2e8f0",padding:"14px 18px"}}>
                 <div style={{display:"flex",justifyContent:"space-between",gap:12,flexWrap:"wrap",alignItems:"flex-start"}}>
+                  {imageOf(a)&&(
+                    <img src={imageOf(a)} alt="" onClick={()=>setZoomSrc(imageOf(a))} title="לחץ להגדלה"
+                      style={{width:96,height:64,objectFit:"cover",borderRadius:7,border:"1px solid #e2e8f0",cursor:"zoom-in",flexShrink:0}}/>
+                  )}
                   <div style={{flex:1,minWidth:220}}>
                     <div style={{fontSize:15,fontWeight:800,color:ACCENT,marginBottom:4}}>{a.draftContent?.title||a.publishedContent?.title||a.title}</div>
                     <div style={{fontSize:12,color:"#64748b",marginBottom:8}}>{clientName}{a.keywords?" · "+a.keywords:""}</div>
@@ -2167,10 +2192,15 @@ function ArticlesLibrary({activeClientId,onWriteArticle}){
                 <button onClick={()=>setPreview(null)} style={{background:"#f1f5f9",border:"none",borderRadius:7,padding:"7px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>✕</button>
               </div>
             </div>
+            {imageOf(preview.article)&&(
+              <img src={imageOf(preview.article)} alt="" onClick={()=>setZoomSrc(imageOf(preview.article))} title="לחץ להגדלה"
+                style={{width:"100%",maxHeight:360,objectFit:"cover",borderRadius:10,marginBottom:16,cursor:"zoom-in"}}/>
+            )}
             <ArticleView text={articleBody(preview.article)}/>
           </div>
         </div>
       )}
+      {zoomSrc&&<ImageLightbox src={zoomSrc} onClose={()=>setZoomSrc(null)}/>}
 
       {versionsModal&&(
         <div style={{position:"fixed",inset:0,background:"#0f172a90",zIndex:1000,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
