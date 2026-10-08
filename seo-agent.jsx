@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { supabase } from "./src/supabaseClient.js";
+import { supabase, supabaseError } from "./src/supabaseClient.js";
 
 const ACCENT = "#0a0f1e";
 const BLUE   = "#2563eb";
@@ -344,7 +344,7 @@ const getActiveClients=(activeClientId)=>activeClientId?DB.get().filter(c=>c.id=
 const reviewToken=()=>Array.from(crypto.getRandomValues(new Uint8Array(18)),b=>b.toString(16).padStart(2,"0")).join("");
 
 const createReviewLink=async({clientId,clientName,articleId,content})=>{
-  if(!supabase)throw new Error("קישור לאישור דורש חיבור ל-Supabase");
+  if(!supabase)throw new Error("קישור לאישור דורש חיבור ל-Supabase — "+(supabaseError||"לא מוגדר"));
   const token=reviewToken();
   const {error}=await supabase.from("article_reviews").insert({
     token, client_id:clientId, article_id:articleId, client_name:clientName||"",
@@ -2419,6 +2419,11 @@ export default function SEOAgent(){
             }} badge={n.badge}/>)}
           </div>
         </div>
+        {supabaseError&&(
+          <div style={{background:"#fef2f2",borderBottom:"1px solid #fecaca",color:"#991b1b",padding:"8px 24px",fontSize:13,fontWeight:600,flexShrink:0}}>
+            ⚠ סנכרון לענן כבוי — הנתונים נשמרים רק בדפדפן הזה, ופרסום אוטומטי וקישורי אישור לא יעבדו. הסיבה: {supabaseError}
+          </div>
+        )}
         <div style={{display:"flex",flex:1,overflow:"hidden"}}>
           {page==="scan"    && <SiteScanner onClientSaved={id=>{setOpenClientId(id);setActiveClientId(id);setPage("clients");}}/>}
           {page==="clients" && <ClientManager initialOpenId={openClientId} onSelectClient={id=>setActiveClientId(id)}/>}
